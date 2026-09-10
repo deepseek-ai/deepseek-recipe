@@ -9,7 +9,7 @@
 deepseek-recipe 包含一套 Rust 库以及对应的 Python bindings：支持将不同格式的 API 请求统一转换为 Conversation 格式，编码成适用于 DeepSeek 模型的 prompt，并支持将模型输出转换为对应格式的响应。
 可用于把推理后端接入兼容多种格式的 API 服务；模型推理、工具执行和 HTTP 传输需由外部提供。
 
-[快速上手](#使用-deepseek-recipe) · [流式响应](docs/streaming.zh.md) · [使用 tokenizer](docs/tokenizer.zh.md) · [贡献指南](CONTRIBUTING.md) · [许可证](#许可证)
+[快速上手](#使用-deepseek-recipe) · [流式响应](docs/streaming.zh.md) · [使用 tokenizer](docs/tokenizer.zh.md) · [许可证](#许可证)
 
 ## 支持范围
 

@@ -13,14 +13,13 @@ into responses in the corresponding format. Use these components to connect an
 inference backend to API services that support multiple formats. Model
 inference, tool execution, and HTTP transport must be provided externally.
 
-[Getting started](#using-deepseek-recipe) · [Streaming](docs/streaming.md) ·
-[Use with tokenizer](docs/tokenizer.md) · [Contributing](CONTRIBUTING.md) ·
-[License](#license)
+[Getting started](#using-deepseek-recipe) · [Streaming response](docs/streaming.md) ·
+[Use with tokenizer](docs/tokenizer.md) · [License](#license)
 
 ## Supported scope
 
 - **Request/response formats:** Conversion of Messages, Chat Completions, and
-  Responses requests, [streamed responses](docs/streaming.md), and complete
+  Responses requests, [Streaming response](docs/streaming.md), and complete
   responses. Supports text, images, thinking, and client tool calls.
 - **Prompts:** Encoding of DeepSeek V4 and V4.1 conversations into prompts or token IDs.
 - **Generation settings:** Thinking mode, reasoning effort, `temperature`, `top_p`,
@@ -114,7 +113,7 @@ Open [http://127.0.0.1:7778](http://127.0.0.1:7778).
 ### More examples
 
 Rust and Python both support converting model output into streaming responses.
-See the [streaming examples](docs/streaming.md). To encode conversations into
+See the [Streaming response](docs/streaming.md). To encode conversations into
 token IDs or decode backend token IDs, see
 [use with tokenizer](docs/tokenizer.md).
 

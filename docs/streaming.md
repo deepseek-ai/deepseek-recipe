@@ -1,4 +1,4 @@
-# Response streaming
+# Streaming response
 
 **English** | [中文](streaming.zh.md)
 
