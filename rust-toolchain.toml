@@ -1,0 +1,4 @@
+[toolchain]
+# https://releases.rs/docs/1.97.1/
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]

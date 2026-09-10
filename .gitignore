@@ -1,0 +1,11 @@
+**/target/
+.venv/
+__pycache__/
+.pytest_cache/
+*.so
+*.pyd
+*.dSYM/
+*.egg-info/
+dist/
+dist-repaired/
+.vscode/

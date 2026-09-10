@@ -1,0 +1,24 @@
+[package]
+name = "deepseek-recipe"
+version = "0.1.0"
+edition.workspace = true
+description = "API request conversion and streamed output parsing for DeepSeek models."
+readme.workspace = true
+documentation = "https://docs.rs/deepseek-recipe"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream = { workspace = true }
+base64 = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+itertools = { workspace = true }
+jsonschema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum_macros = { workspace = true }
+tokenizers = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

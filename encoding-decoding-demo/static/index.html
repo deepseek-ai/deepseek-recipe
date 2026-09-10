@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deepseek-recipe · Encoding &amp; Decoding Demo</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="masthead">
+  <h1><span class="brand">deepseek-recipe</span></h1>
+  <span class="badge">Encoding &amp; Decoding Demo</span>
+</header>
+
+<nav class="toolbar" aria-label="Encoding, decoding, and API format">
+  <div class="mode-tabs" role="tablist" aria-label="Mode">
+    <button id="mode-encode" class="mode-tab active" type="button" data-mode="encode" role="tab" aria-controls="encode-panel" aria-selected="true" tabindex="0">Encode</button>
+    <button id="mode-decode" class="mode-tab" type="button" data-mode="decode" role="tab" aria-controls="decode-panel" aria-selected="false" tabindex="-1">Decode</button>
+  </div>
+  <span class="toolbar-divider" aria-hidden="true"></span>
+  <div class="tabs" role="tablist" aria-label="API format">
+    <button class="tab" type="button" data-format="chat_completions" role="tab">Chat Completions</button>
+    <button class="tab" type="button" data-format="responses" role="tab">Responses</button>
+    <button class="tab" type="button" data-format="messages" role="tab">Messages</button>
+  </div>
+</nav>
+
+<main>
+  <section id="encode-panel" class="mode-panel" role="tabpanel" aria-labelledby="mode-encode">
+    <div id="error" class="error" role="alert" hidden></div>
+    <div class="grid">
+      <section class="pane">
+        <header class="pane-header">
+          <div class="pane-heading">
+            <h2><label for="input">Original input</label></h2>
+          </div>
+          <div id="encode-actions" class="actions">
+            <button id="render-prompt" class="primary" type="button" title="Encode (⌘/Ctrl + Enter)">Encode</button>
+          </div>
+        </header>
+        <textarea id="input" spellcheck="false" autocomplete="off"></textarea>
+      </section>
+      <section class="pane">
+        <header class="pane-header">
+          <h2>Encoded result <span id="meta" class="meta"></span></h2>
+        </header>
+        <pre id="output" class="prompt"></pre>
+      </section>
+    </div>
+  </section>
+
+  <section id="decode-panel" class="mode-panel" role="tabpanel" aria-labelledby="mode-decode" hidden>
+    <div id="decode-error" class="error" role="alert" hidden></div>
+    <div class="grid">
+      <section class="pane">
+        <header class="pane-header">
+          <div class="pane-heading">
+            <h2><label for="model-output">Original output</label></h2>
+          </div>
+          <div id="decode-actions" class="actions" hidden>
+            <button id="decode-output" class="primary" type="button" title="Decode (⌘/Ctrl + Enter)">Decode</button>
+          </div>
+        </header>
+        <div class="model-editor">
+          <pre id="model-output-preview" aria-hidden="true"></pre>
+          <textarea id="model-output" spellcheck="false" autocomplete="off"></textarea>
+        </div>
+      </section>
+      <section class="pane">
+        <header class="pane-header">
+          <h2>Decoded result <span id="response-format" class="meta">Chat Completions</span> <span id="decode-meta" class="meta" role="status"></span></h2>
+        </header>
+        <pre id="decoded-output" class="prompt response" aria-label="Decoded result"></pre>
+      </section>
+    </div>
+  </section>
+</main>
+
+<div id="tip" class="tooltip" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "deepseek-recipe",
+    "deepseek-recipe-core",
+    "deepseek-recipe-encoding",
+    "deepseek-recipe-image",
+    "deepseek-recipe-python",
+    "encoding-decoding-demo",
+    "server-rs",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/deepseek-recipe"
+
+[workspace.dependencies]
+async-stream = "0.3.6"
+axum = "0.8.7"
+base64 = "0.22.1"
+data-url = "0.3.2"
+deepseek-recipe = { version = "0.1.0", path = "deepseek-recipe" }
+deepseek-recipe-core = { version = "0.1.0", path = "deepseek-recipe-core" }
+deepseek-recipe-encoding = { version = "0.1.0", path = "deepseek-recipe-encoding" }
+deepseek-recipe-image = { version = "0.1.0", path = "deepseek-recipe-image" }
+futures = "0.3.31"
+image = { version = "0.25.0", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
+infer = "0.19.0"
+itertools = "0.14.0"
+jsonschema = { version = "0.18.3", default-features = false }
+opencv = { version = "0.93", default-features = false, features = [
+    "clang-runtime",
+    "imgcodecs",
+    "imgproc",
+] }
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+strum_macros = "0.28.0"
+thiserror = "2.0.17"
+tokenizers = { version = "0.23.2", features = ["http"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1.17"
+tracing = "0.1.41"

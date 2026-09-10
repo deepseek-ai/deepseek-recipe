@@ -1,0 +1,17 @@
+[package]
+name = "deepseek-recipe-encoding"
+version = "0.1.0"
+edition.workspace = true
+description = "Conversation rendering and token encoding for DeepSeek V4 and V4.1 prompts."
+readme.workspace = true
+documentation = "https://docs.rs/deepseek-recipe-encoding"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+deepseek-recipe-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }

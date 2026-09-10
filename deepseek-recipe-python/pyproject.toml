@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+# The distribution name of PyPI; the import name stays `deepseek_recipe`. The
+# Cargo package of this crate, and its directory, keep their own name.
+name = "deepseek-recipe"
+# The version of the distribution; the Cargo packages keep their own version.
+version = "0.1.1"
+description = "Python bindings for deepseek-recipe components"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+# PyPI shows these links on the project page. The instance serves them once the
+# repository is public.
+[project.urls]
+Homepage = "https://github.com/deepseek-ai/deepseek-recipe"
+Repository = "https://github.com/deepseek-ai/deepseek-recipe"
+Documentation = "https://github.com/deepseek-ai/deepseek-recipe/tree/main/docs"
+Issues = "https://github.com/deepseek-ai/deepseek-recipe/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "deepseek_recipe._native"
+features = ["pyo3/extension-module"]
+# Importing the package from the source tree leaves `__pycache__` behind, and the
+# python-source walk picks it up. Exclude it from the wheel and the sdist.
+exclude = ["**/__pycache__/**"]

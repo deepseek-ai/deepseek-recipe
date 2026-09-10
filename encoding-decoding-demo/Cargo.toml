@@ -1,0 +1,16 @@
+[package]
+name = "encoding-decoding-demo"
+version = "0.1.0"
+edition.workspace = true
+description = "A local web interface for inspecting DeepSeek prompts and decoding model output."
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+deepseek-recipe = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+deepseek-recipe-encoding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }

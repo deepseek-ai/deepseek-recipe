@@ -1,0 +1,21 @@
+[package]
+name = "server-rs"
+version = "0.1.0"
+edition.workspace = true
+description = "An Axum example for DeepSeek protocol conversion with mock inference."
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+deepseek-recipe = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+deepseek-recipe-encoding = { workspace = true }
+deepseek-recipe-image = { version = "0.1.0", path = "../deepseek-recipe-image", features = [
+    "opencv-preprocess",
+    "reqwest-fetch",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }

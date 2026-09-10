@@ -1,0 +1,30 @@
+[package]
+name = "deepseek-recipe-image"
+version = "0.1.0"
+edition.workspace = true
+description = "Image fetching and preprocessing for DeepSeek V4.1 model input."
+readme.workspace = true
+documentation = "https://docs.rs/deepseek-recipe-image"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+data-url = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true, optional = true }
+infer = { workspace = true, optional = true }
+opencv = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["opencv-preprocess", "reqwest-fetch"]
+# Supply `OpenCvImagePreprocessor` for DeepSeek V4.1 preprocessing. Disable this
+# feature to build without OpenCV when the caller supplies a preprocessor.
+opencv-preprocess = ["dep:image", "dep:infer", "dep:opencv"]
+# Supply `ReqwestImageFetcher` for downloading images from external URLs.
+reqwest-fetch = ["dep:reqwest"]
