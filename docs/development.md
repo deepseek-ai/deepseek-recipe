@@ -51,7 +51,7 @@ deepseek-recipe-encoding = { path = "../deepseek-recipe/deepseek-recipe-encoding
 serde_json = "1"
 ```
 
-Save the Rust quick-start example from the [README](../README.md#quick-start)
+Save the Rust quick-start example from the [README](../README.md#rust)
 as `../recipe-example/src/main.rs`. Run it from the repository root to use the
 pinned toolchain:
 
