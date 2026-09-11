@@ -113,7 +113,11 @@ def prepare_request(
             resolver = ImageResolver(ReqwestImageFetcher(), OpenCvImagePreprocessor())
             multimodal = resolver.resolve(rendered.image_sources, ImageQuota())
         except ImageError as error:
-            status_code = 500 if error.kind in {"Client", "TokenBudget"} else 400
+            # `is_retryable` marks the upstream failures a client may retry; `Client`
+            # is this server's own HTTP client failing to build.
+            status_code = (
+                500 if error.is_retryable or error.kind in {"Client", "TokenBudget"} else 400
+            )
             raise RequestError(str(error), status_code) from error
         images = multimodal.images
         try:
