@@ -1,6 +1,9 @@
 """Smoke tests for the FastAPI example and its inference callback."""
 
 import importlib.util
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -121,3 +124,66 @@ def test_web_search_conversion_options():
     assert accepted.status_code == 200, accepted.text
     assert response_text("/v1/messages", accepted.json()) == "Hello world!"
     assert rejected.status_code == 400
+
+
+class _StubImageHost(BaseHTTPRequestHandler):
+    """A local origin that answers every GET with a fixed status code."""
+
+    status = 503
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(self.status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def image_host(status):
+    """Serve one image URL whose origin always answers `status`."""
+    _StubImageHost.status = status
+    server = HTTPServer(("127.0.0.1", 0), _StubImageHost)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/image.png"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "upstream,expected_status,expected_type",
+    [(503, 500, "internal_error"), (404, 400, "invalid_request_error")],
+)
+def test_image_fetch_failure_follows_retryability(
+    upstream, expected_status, expected_type
+):
+    """An upstream image failure is the server's to own only when it is retryable.
+
+    `ImageError.is_retryable` is the library's classification: `Fetch` is always
+    retryable and `FetchStatus` is retryable at 5xx. Answering a retryable upstream
+    failure with 400 tells the client its request was malformed and should not be
+    retried, which inverts the classification the library hands over.
+    """
+    with image_host(upstream) as url:
+        with TestClient(SERVER.app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "deepseek-flash",
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe this"},
+                                {"type": "image_url", "image_url": {"url": url}},
+                            ],
+                        }
+                    ],
+                },
+            )
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["type"] == expected_type
