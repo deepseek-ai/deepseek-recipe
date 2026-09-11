@@ -302,12 +302,18 @@ impl State {
             }
             Stage::ToolCallArguments { is_leading } => {
                 match_branches.new_string_branch(
-                    "parameter name=",
+                    "parameter name=\"",
                     Stage::ToolCallParamName,
                     if is_leading {
-                        ActionOnMatched::LabelToolCallArguments { label: "{", id: 0 }
+                        ActionOnMatched::LabelToolCallArguments {
+                            label: "{\"",
+                            id: 0,
+                        }
                     } else {
-                        ActionOnMatched::LabelToolCallArguments { label: ", ", id: 1 }
+                        ActionOnMatched::LabelToolCallArguments {
+                            label: ", \"",
+                            id: 1,
+                        }
                     },
                 );
                 match_branches.new_string_branch(
@@ -323,9 +329,12 @@ impl State {
             }
             Stage::ToolCallParamName => {
                 match_branches.new_string_branch(
-                    " ",
+                    "\"",
                     Stage::ToolCallParamType,
-                    ActionOnMatched::LabelToolCallArguments { label: ": ", id: 2 },
+                    ActionOnMatched::LabelToolCallArguments {
+                        label: "\": ",
+                        id: 2,
+                    },
                 );
                 ActionOnUnmatched::RawToolCallArguments { string: false }
             }
