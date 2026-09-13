@@ -38,6 +38,14 @@ pub struct ConversationRequest {
     /// Original model name, when exposed by the adapter. The caller resolves it.
     pub model: Option<String>,
     pub stream: bool,
+    /// Number of parallel completions the caller should generate for this
+    /// conversation.
+    ///
+    /// Always `1` for protocols that don't expose a multi-completion parameter.
+    /// Chat Completions surfaces this from its `n` request field. The caller
+    /// runs inference once per completion and tags each with a distinct
+    /// `choice_index` via [`ProtocolRequest::chunk_generator_for_choice`].
+    pub completion_count: u32,
 }
 
 impl ConversationRequest {
@@ -49,6 +57,7 @@ impl ConversationRequest {
             parsing_options: ParsingOptions::default(),
             model: None,
             stream: false,
+            completion_count: 1,
         }
     }
 }
@@ -68,11 +77,38 @@ pub trait ProtocolRequest: 'static + Send + Sync {
     fn convert(self, options: ConversionOptions) -> Result<ConversationRequest, ConversionError>;
 
     /// Construct protocol events using the converted request's resolved settings.
+    ///
+    /// Equivalent to [`Self::chunk_generator_for_choice`] with `choice_index`
+    /// `0`. Protocols that never produce more than one completion can keep
+    /// implementing only this method.
     fn chunk_generator(
         request: &ConversationRequest,
         id: String,
         model: String,
     ) -> <Self::Response as ProtocolResponse>::ChunkGenerator;
+
+    /// Construct protocol events for one completion of a `completion_count > 1`
+    /// request.
+    ///
+    /// `choice_index` identifies which of the caller's parallel completions
+    /// this generator's output belongs to; the generator must tag every event
+    /// it produces with that index. The caller runs one inference per
+    /// completion, drives each through its own [`crate::stream::StreamProcessor`]
+    /// built from the generator returned here, and merges (streaming) or
+    /// accumulates (complete response) the results.
+    ///
+    /// The default implementation ignores `choice_index` and delegates to
+    /// [`Self::chunk_generator`], which is correct for every protocol except
+    /// Chat Completions today.
+    fn chunk_generator_for_choice(
+        request: &ConversationRequest,
+        id: String,
+        model: String,
+        choice_index: u32,
+    ) -> <Self::Response as ProtocolResponse>::ChunkGenerator {
+        let _ = choice_index;
+        Self::chunk_generator(request, id, model)
+    }
 }
 
 /// A failure while converting protocol input into a conversation request.

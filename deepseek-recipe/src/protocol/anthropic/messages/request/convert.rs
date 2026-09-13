@@ -59,6 +59,7 @@ impl ProtocolRequest for MessagesRequest {
             parsing_options,
             model: Some(self.model),
             stream: self.stream.unwrap_or(false),
+            completion_count: 1,
         })
     }
 

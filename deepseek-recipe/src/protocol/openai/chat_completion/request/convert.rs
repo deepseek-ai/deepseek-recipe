@@ -28,6 +28,13 @@ use super::schema::{
 /// Maximum number of stop sequences accepted by the adapter.
 const MAX_STOP_SEQUENCES: usize = 16;
 
+/// Maximum number of parallel completions accepted for `n`.
+///
+/// Matches the ceiling OpenAI's own Chat Completions API documents. The
+/// caller is responsible for actually running this many inferences; this
+/// bound only guards against pathological request values.
+const MAX_COMPLETIONS: u8 = 128;
+
 impl ProtocolRequest for ChatCompletionRequest {
     type Response = ChatCompletionResponse;
 
@@ -35,6 +42,7 @@ impl ProtocolRequest for ChatCompletionRequest {
         let (thinking_mode, reasoning_effort) = self.resolve_thinking(options);
         let mut parsing_options = self.parsing_options(thinking_mode);
         let inference_options = self.inference_options()?;
+        let completion_count = validate_completion_count(self.n)?;
         validate_api_params(
             self.stop.as_ref(),
             self.stream,
@@ -60,6 +68,7 @@ impl ProtocolRequest for ChatCompletionRequest {
             parsing_options,
             model: Some(self.model),
             stream: self.stream.unwrap_or(false),
+            completion_count,
         })
     }
 
@@ -68,12 +77,22 @@ impl ProtocolRequest for ChatCompletionRequest {
         id: String,
         model: String,
     ) -> ChatCompletionChunkGenerator {
+        Self::chunk_generator_for_choice(request, id, model, 0)
+    }
+
+    fn chunk_generator_for_choice(
+        request: &ConversationRequest,
+        id: String,
+        model: String,
+        choice_index: u32,
+    ) -> ChatCompletionChunkGenerator {
         ChatCompletionChunkGenerator::new(
             id,
             model,
             !request.stream,
             request.conversation.thinking_mode,
         )
+        .with_choice_index(choice_index)
     }
 }
 
@@ -98,11 +117,6 @@ impl ChatCompletionRequest {
     }
 
     fn inference_options(&self) -> Result<InferenceOptions, ConversionError> {
-        if self.n.is_some_and(|value| value != 1) {
-            return Err(ConversionError::bad_request(
-                "Invalid n value (currently only n = 1 is supported)",
-            ));
-        }
         for (name, value) in [
             ("frequency_penalty", self.frequency_penalty),
             ("presence_penalty", self.presence_penalty),
@@ -481,6 +495,20 @@ fn convert_response_format(
     }
 }
 
+/// Validate `n` and resolve it to the number of completions to generate.
+///
+/// Absent `n` defaults to a single completion, matching the OpenAI API.
+fn validate_completion_count(n: Option<u8>) -> Result<u32, ConversionError> {
+    match n {
+        None => Ok(1),
+        Some(0) => Err(ConversionError::bad_request("n must be at least 1")),
+        Some(value) if value > MAX_COMPLETIONS => Err(ConversionError::bad_request(format!(
+            "n must be at most {MAX_COMPLETIONS}"
+        ))),
+        Some(value) => Ok(u32::from(value)),
+    }
+}
+
 /// Validate stop sequences and streaming options.
 fn validate_api_params(
     stop: Option<&ChatCompletionStopSequences>,
@@ -501,4 +529,76 @@ fn validate_api_params(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::request::{ConversionOptions, ProtocolRequest};
+
+    use super::ChatCompletionRequest;
+
+    /// A minimal, otherwise-valid request with the given `n`.
+    fn request_with_n(n: Option<u8>) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "model": "deepseek-chat",
+            "frequency_penalty": null,
+            "max_tokens": null,
+            "n": n,
+            "presence_penalty": null,
+            "seed": null,
+            "stop": null,
+            "stream": null,
+            "stream_options": null,
+            "temperature": null,
+            "top_p": null,
+            "response_format": null,
+            "tools": null,
+            "tool_choice": null,
+            "reasoning_effort": null,
+            "thinking": null,
+            "parallel_tool_calls": null,
+        }))
+        .expect("fixture request should deserialize")
+    }
+
+    #[test]
+    fn n_absent_defaults_to_one_completion() {
+        let request = request_with_n(None)
+            .convert(ConversionOptions::default())
+            .unwrap();
+        assert_eq!(request.completion_count, 1);
+    }
+
+    #[test]
+    fn n_one_is_accepted_as_before() {
+        let request = request_with_n(Some(1))
+            .convert(ConversionOptions::default())
+            .unwrap();
+        assert_eq!(request.completion_count, 1);
+    }
+
+    #[test]
+    fn n_greater_than_one_is_now_accepted_and_threaded_through() {
+        let request = request_with_n(Some(4))
+            .convert(ConversionOptions::default())
+            .unwrap();
+        assert_eq!(request.completion_count, 4);
+    }
+
+    #[test]
+    fn n_zero_is_rejected() {
+        let error = request_with_n(Some(0))
+            .convert(ConversionOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn n_above_the_bound_is_rejected() {
+        let error = request_with_n(Some(255))
+            .convert(ConversionOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("at most"));
+    }
 }
