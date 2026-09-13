@@ -13,9 +13,9 @@ use deepseek_recipe::response::ProtocolResponse;
 use deepseek_recipe::stream::ChunkGenerator;
 use serde::{Serialize, de::DeserializeOwned};
 use server_rs::{
-    ConversionError, ErrorResponse, PreparedResponse, complete_response,
-    complete_responses_response, prepare_chat_completion_response, prepare_converted_response,
-    prepare_responses_response,
+    ConversionError, ErrorResponse, PreparedResponse, complete_chat_completion_response,
+    complete_response, complete_responses_response, prepare_chat_completion_response,
+    prepare_converted_response, prepare_responses_response,
 };
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -47,7 +47,10 @@ async fn chat_completion_handler(
             .map(sse_response)
             .map_err(http_error);
     }
-    api_handler(Json(request)).await
+    complete_chat_completion_response(request)
+        .await
+        .map(|response| Json(response).into_response())
+        .map_err(http_error)
 }
 
 async fn responses_handler(Json(request): Json<ResponsesRequest>) -> Result<Response, ApiError> {

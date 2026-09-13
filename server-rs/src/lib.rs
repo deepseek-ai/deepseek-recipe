@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use deepseek_recipe::anthropic::MessagesRequest;
 pub use deepseek_recipe::error_response::ErrorResponse;
+use deepseek_recipe::openai::chat_completion::response::ChatCompletionResponse;
 use deepseek_recipe::openai::responses::response::ResponsesResponse;
 use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
 pub use deepseek_recipe::request::ConversionError;
@@ -27,7 +28,7 @@ use deepseek_recipe_image::{
     ImageError, ImageQuota, ImageResolver, OpenCvImagePreprocessor, ReqwestImageFetcher,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::{Stream, StreamExt, StreamMap};
 
 const MOCK_ID: &str = "mock-id";
 const MOCK_MODEL: &str = "deepseek-flash";
@@ -135,6 +136,10 @@ where
 
 /// Prepare Chat Completions SSE using the request's usage inclusion setting.
 ///
+/// When the request's `n` asks for more than one completion, runs one mock
+/// inference per completion and interleaves their chunks as they arrive, each
+/// tagged with its own `choices[].index`.
+///
 /// # Errors
 ///
 /// Returns the protocol conversion error before producing response events, or a
@@ -145,10 +150,131 @@ pub async fn prepare_chat_completion_response(
 ) -> Result<PreparedResponse, ConversionError> {
     let include_usage = req.include_usage();
     let request = req.convert(ConversionOptions::default())?;
-    prepare_converted_response_with::<ChatCompletionRequest>(request, |generator| {
-        generator.with_include_usage(include_usage)
+    if request.completion_count <= 1 {
+        return prepare_converted_response_with::<ChatCompletionRequest>(request, |generator| {
+            generator.with_include_usage(include_usage)
+        })
+        .await;
+    }
+    prepare_multi_completion_response(request, include_usage).await
+}
+
+/// Prepare Chat Completions SSE for a `n > 1` request.
+///
+/// Each of the `n` completions gets its own mock inference stream and its own
+/// [`StreamProcessor`], built with a distinct `choice_index` so downstream
+/// chunks carry the right `choices[].index`. A [`StreamMap`] merges the `n`
+/// processors so chunks are emitted in true arrival order rather than one
+/// completion at a time, mirroring how a real backend would interleave
+/// parallel generations.
+///
+/// # Errors
+///
+/// Returns a conversion error with status code 400 or 500 when an image cannot
+/// be resolved or preprocessed.
+async fn prepare_multi_completion_response(
+    request: ConversationRequest,
+    include_usage: bool,
+) -> Result<PreparedResponse, ConversionError> {
+    let rendered = DeepseekV41Encoding::new().render_conversation(&request.conversation);
+    let resolver = default_resolver()?;
+    let mut quota = ImageQuota::new();
+    let multi_modal_data = resolver
+        .resolve(&rendered.image_sources, &mut quota)
+        .await
+        .map_err(image_error)?;
+    tracing::debug!(
+        prompt = rendered.prompt,
+        image_count = multi_modal_data.images.len(),
+        completion_count = request.completion_count,
+        "rendered prompt for multi-completion request"
+    );
+
+    let mut processors = StreamMap::new();
+    for choice_index in 0..request.completion_count {
+        let generator = ChatCompletionRequest::chunk_generator_for_choice(
+            &request,
+            MOCK_ID.into(),
+            MOCK_MODEL.into(),
+            choice_index,
+        )
+        .with_include_usage(include_usage);
+        let processor = StreamProcessor::new(generator, request.parsing_options.clone());
+        processors.insert(choice_index, Box::pin(processor.process(mock_inference())));
+    }
+
+    let events = processors.map(|(_choice_index, chunk)| {
+        let chunk = chunk.map_err(|error| serde_json::Error::io(std::io::Error::other(error)))?;
+        let data = serde_json::to_string(&chunk)?;
+        Ok(
+            match <ChatCompletionResponse as ProtocolResponse>::chunk_event_type(&chunk) {
+                Some(event_type) => format!("event: {event_type}\ndata: {data}\n\n"),
+                None => format!("data: {data}\n\n"),
+            },
+        )
+    });
+    let done = <ChatCompletionResponse as ProtocolResponse>::done_message()
+        .map(|message| Ok(format!("data: {message}\n\n")));
+
+    Ok(PreparedResponse {
+        prompt: rendered.prompt,
+        multi_modal_data,
+        events: Box::pin(events.chain(tokio_stream::iter(done))),
     })
-    .await
+}
+
+/// Aggregate a `n > 1` Chat Completions request into a single JSON response.
+///
+/// Every completion's chunks append into the same [`ChatCompletionResponse`];
+/// its accumulator already keys choices by `index`, so no merge logic is
+/// needed beyond running each completion's chunks through `.append()`.
+///
+/// # Errors
+///
+/// Returns a conversion error with status code 400 or 500 when an image cannot
+/// be resolved or preprocessed, or if a completion's output fails to process.
+pub async fn complete_chat_completion_response(
+    req: ChatCompletionRequest,
+) -> Result<ChatCompletionResponse, ConversionError> {
+    let include_usage = req.include_usage();
+    let request = req.convert(ConversionOptions::default())?;
+    if request.completion_count <= 1 {
+        return complete_response_with::<ChatCompletionRequest>(request, |generator| {
+            generator.with_include_usage(include_usage)
+        })
+        .await;
+    }
+
+    let rendered = DeepseekV41Encoding::new().render_conversation(&request.conversation);
+    let resolver = default_resolver()?;
+    let mut quota = ImageQuota::new();
+    resolver
+        .resolve(&rendered.image_sources, &mut quota)
+        .await
+        .map_err(image_error)?;
+
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut response =
+        ChatCompletionResponse::new(MOCK_ID.into(), MOCK_MODEL.into(), created, 0, 0);
+    for choice_index in 0..request.completion_count {
+        let generator = ChatCompletionRequest::chunk_generator_for_choice(
+            &request,
+            MOCK_ID.into(),
+            MOCK_MODEL.into(),
+            choice_index,
+        )
+        .with_include_usage(include_usage);
+        let processor = StreamProcessor::new(generator, request.parsing_options.clone());
+        let mut chunks = pin!(processor.process(mock_inference()));
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| ConversionError::internal(error.to_string()))?;
+            response.append(chunk);
+        }
+    }
+    Ok(response)
 }
 
 /// Prepare Responses SSE using the request's custom tool declarations.

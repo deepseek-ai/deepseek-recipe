@@ -585,6 +585,7 @@ impl ProtocolRequest for ResponsesRequest {
             parsing_options,
             model: Some(self.model),
             stream: self.stream.unwrap_or(false),
+            completion_count: 1,
         })
     }
 

@@ -29,6 +29,11 @@ inference, tool execution, and HTTP transport must be provided externally.
   DeepSeek V4.1 preprocessing with OpenCV.
 - **Tool definitions:** Function tools; the Responses API also supports tool
   namespaces and the `apply_patch` custom tool.
+- **Multiple completions:** Chat Completions `n > 1`. The adapter validates
+  and threads `n` through as `ConversationRequest::completion_count`; the
+  caller runs one inference per completion and builds each completion's
+  events with [`ProtocolRequest::chunk_generator_for_choice`], tagging every
+  chunk with its `choices[].index`.
 
 ## Not yet supported
 
@@ -36,7 +41,6 @@ inference, tool execution, and HTTP transport must be provided externally.
 - Document content, audio/video input, and file retrieval by `file_id`.
 - Server tool execution, such as `web_search`.
 - JSON Schema and regex output constraints, or enforcement of tool `strict` settings.
-- Multiple completions per Chat Completions request (`n > 1`).
 - Responses custom tool definitions other than `apply_patch`.
 - Responses conversation storage and context retrieval through `previous_response_id`.
 - Responses encrypted thinking content (`encrypted_content`).

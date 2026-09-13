@@ -307,3 +307,55 @@ impl AppendDelta<ChatCompletionMessageDelta> for ChatCompletionResponseMessage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_chunk(index: u32, content: &str) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: "resp_1".to_string(),
+            object: CHAT_COMPLETION_CHUNK_OBJECT,
+            created: 0,
+            model: "deepseek-chat".to_string(),
+            system_fingerprint: None,
+            choices: vec![ChatCompletionChunkChoice {
+                index,
+                delta: ChatCompletionMessageDelta {
+                    content: Some(Some(content.to_string())),
+                    ..Default::default()
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    /// Regression test for the `n > 1` non-streaming path: the accumulator
+    /// keys choices by `index`, so interleaved chunks from several
+    /// completions must land in separate, independently-growing choices
+    /// rather than clobbering each other.
+    #[test]
+    fn chunks_with_different_indices_accumulate_into_separate_choices() {
+        let mut response =
+            ChatCompletionResponse::new("resp_1".into(), "deepseek-chat".into(), 0, 0, 0);
+        response.append(text_chunk(0, "Hello"));
+        response.append(text_chunk(1, "Hi"));
+        response.append(text_chunk(0, " world"));
+
+        assert_eq!(response.choices.len(), 2);
+        let choice0 = response
+            .choices
+            .iter()
+            .find(|choice| choice.index == 0)
+            .expect("choice 0 present");
+        let choice1 = response
+            .choices
+            .iter()
+            .find(|choice| choice.index == 1)
+            .expect("choice 1 present");
+        assert_eq!(choice0.message.content.as_deref(), Some("Hello world"));
+        assert_eq!(choice1.message.content.as_deref(), Some("Hi"));
+    }
+}
