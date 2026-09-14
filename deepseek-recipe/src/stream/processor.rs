@@ -124,6 +124,14 @@ where
                     started = true;
                 }
                 completion_usage.completion_tokens += content_tokens;
+                // Empty text chunks can still account for backend tokens, but
+                // they must not enter the parser. In JSON mode an unmatched
+                // source chunk is represented by one space; stashing an empty
+                // chunk would therefore create output that depends on how the
+                // backend partitions an otherwise identical text stream.
+                if content.is_empty() {
+                    continue;
+                }
                 let actions = state_machine.feed(&content);
                 stashed.push(Some(content));
                 for out in stashed.apply_actions(actions, &mut generator).await {
@@ -222,9 +230,15 @@ impl StashedChunks {
             OutputAction::Reasoning => {
                 non_empty(front_chunk).map(|content| OutputChunk::Reasoning { content })
             }
-            OutputAction::ToSpace => Some(OutputChunk::Raw {
-                content: " ".to_string(),
-            }),
+            OutputAction::ToSpace => {
+                if last_pop_action != OutputAction::ToSpace {
+                    Some(OutputChunk::Raw {
+                        content: " ".to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
             OutputAction::Skip | OutputAction::SkipInvalid { .. } => None,
             OutputAction::StopSequence => {
                 let content = front_chunk.unwrap_or_default();
