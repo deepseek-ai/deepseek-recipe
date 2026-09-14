@@ -1,5 +1,6 @@
 use deepseek_recipe_core::conversation::{Conversation, ReasoningEffort, ResponseFormat};
 use deepseek_recipe_core::messages::{InputMessage, ToolCall};
+use deepseek_recipe_core::multimodal::ImageSource;
 use deepseek_recipe_core::tools::{ToolChoice, ToolDefinition};
 use deepseek_recipe_core::util::json_formatter::stringify_python_style;
 
@@ -115,57 +116,67 @@ fn render_tool_calls(encoding: &impl EncodingV4, tool_calls: &[ToolCall]) -> Str
         .join("\n")
 }
 
-fn render_message(
+/// A rendered prompt fragment: `true` marks template control tokens (encoded
+/// with added-token recognition), `false` marks message content (encoded as
+/// plain BPE so user-supplied control-token literals are not smuggled in as
+/// single control tokens).
+type PromptSegment = (bool, String);
+
+fn render_message_segments(
     encoding: &impl EncodingV4,
     messages: &[InputMessage],
     index: usize,
     thinking_mode: bool,
     reasoning_effort: Option<ReasoningEffort>,
-) -> String {
+) -> Vec<PromptSegment> {
     let msg = &messages[index];
     let prev = messages[..index].last();
     let reasoning_effort_prompt =
         encoding.render_reasoning_effort(index, thinking_mode, reasoning_effort);
-    let mut prompt = if index == 0
+    let mut segments: Vec<PromptSegment> = Vec::new();
+    let mut push = |is_template: bool, text: &str| {
+        if !text.is_empty() {
+            segments.push((is_template, text.to_string()));
+        }
+    };
+    if index == 0
         && (!reasoning_effort_prompt.is_empty() || matches!(msg, InputMessage::System { .. }))
     {
-        encoding.system_token().to_string()
-    } else {
-        String::new()
-    };
-    prompt += &reasoning_effort_prompt;
+        push(true, encoding.system_token());
+    }
+    push(false, &reasoning_effort_prompt);
     match msg {
         InputMessage::System { content } => {
             if index > 0 && encoding.supports_mid_conversation_system() {
-                prompt += encoding.system_token();
+                push(true, encoding.system_token());
             }
-            prompt += content;
+            push(false, content);
         }
         InputMessage::User { content, .. } => {
             if matches!(
                 prev,
                 Some(InputMessage::User { .. } | InputMessage::Tool { .. })
             ) {
-                prompt += "\n\n";
+                push(true, "\n\n");
             } else {
-                prompt += USER_SP_TOKEN;
+                push(true, USER_SP_TOKEN);
             }
-            prompt += content;
+            push(false, content);
         }
         InputMessage::LatestReminder { content } => {
-            prompt += LATEST_REMINDER_SP_TOKEN;
-            prompt += content;
+            push(true, LATEST_REMINDER_SP_TOKEN);
+            push(false, content);
         }
         InputMessage::Tool { content, .. } => {
             if matches!(
                 prev,
                 Some(InputMessage::User { .. } | InputMessage::Tool { .. })
             ) {
-                prompt += "\n\n";
+                push(true, "\n\n");
             } else {
-                prompt += USER_SP_TOKEN;
+                push(true, USER_SP_TOKEN);
             }
-            prompt += &format!("<tool_result>{content}</tool_result>");
+            push(false, &format!("<tool_result>{content}</tool_result>"));
         }
         InputMessage::Assistant {
             content,
@@ -181,104 +192,130 @@ fn render_message(
                 }
                 _ => String::new(),
             };
-            let mut thinking_part = String::new();
+            push(true, ASSISTANT_SP_TOKEN);
             if thinking_mode && index > 0 {
+                push(true, THINKING_START_TOKEN);
                 if let Some(reasoning_content) = reasoning_content {
-                    thinking_part += reasoning_content;
+                    push(false, reasoning_content);
                 }
-                thinking_part += THINKING_END_TOKEN;
-            }
-            prompt += ASSISTANT_SP_TOKEN;
-            prompt += if !thinking_part.is_empty() {
-                THINKING_START_TOKEN
+                push(true, THINKING_END_TOKEN);
             } else {
-                THINKING_END_TOKEN
-            };
-            prompt += &thinking_part;
-            prompt += content;
-            prompt += &tool_calls_content;
-            prompt += EOS_TOKEN;
+                push(true, THINKING_END_TOKEN);
+            }
+            push(false, content);
+            push(true, &tool_calls_content);
+            push(true, EOS_TOKEN);
         }
     }
-    prompt
+    segments
 }
 
 impl<T: EncodingV4> PromptEncoding for T {
     fn encode(&self, conversation: &Conversation) -> Result<Vec<u32>, EncodingError> {
         let tokenizer = self.tokenizer().ok_or(EncodingError::MissingTokenizer)?;
-        let rendered = self.render_conversation(conversation);
-        tokenizer
-            .encode_ids(&rendered.prompt)
-            .map_err(EncodingError::Encode)
+        let (segments, _) = render_parts(self, conversation);
+        let mut ids = Vec::new();
+        for (is_template, text) in segments {
+            let seg_ids = if is_template {
+                tokenizer.encode_ids(&text)
+            } else {
+                tokenizer.encode_content_ids(&text)
+            }
+            .map_err(EncodingError::Encode)?;
+            ids.extend(seg_ids);
+        }
+        Ok(ids)
     }
 
     fn render_conversation(&self, conversation: &Conversation) -> RenderedPrompt {
-        let mut messages = normalize_messages(self, &conversation.messages);
-        let has_tools =
-            conversation.tool_choice != ToolChoice::None && !conversation.tools.is_empty();
-        let format_schema = match &conversation.response_format {
-            ResponseFormat::Text => None,
-            ResponseFormat::JsonObject => Some(stringify_python_style(&serde_json::json!({
-                "type": "json_object"
-            }))),
-        };
-        if has_tools || format_schema.is_some() {
-            if !matches!(messages.first(), Some(InputMessage::System { .. })) {
-                messages.insert(
-                    0,
-                    InputMessage::System {
-                        content: String::new(),
-                    },
-                );
-            }
-            if let Some(InputMessage::System { content }) = messages.first_mut() {
-                if has_tools {
-                    content.push_str("\n\n");
-                    content.push_str(&render_tool_prompt(self, &conversation.tools));
-                }
-                if let Some(schema) = format_schema {
-                    content.push_str("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
-                    content.push_str(&schema);
-                }
-            }
-        }
-        let mut prompt = BOS_TOKEN.to_string();
-        for index in 0..messages.len() {
-            prompt += &render_message(
-                self,
-                &messages,
-                index,
-                conversation.thinking_mode,
-                conversation.reasoning_effort,
-            );
-        }
-        prompt.push_str(ASSISTANT_SP_TOKEN);
-        prompt.push_str(if conversation.thinking_mode {
-            THINKING_START_TOKEN
-        } else {
-            THINKING_END_TOKEN
-        });
-        if conversation.tool_choice == ToolChoice::Required && !conversation.tools.is_empty() {
-            prompt.push_str(&format!(
-                "\n\n<{DSML_SP_TOKEN}{}>\n",
-                self.tool_calls_block_name()
-            ));
-        }
-        let image_sources = messages
+        let (segments, image_sources) = render_parts(self, conversation);
+        let prompt = segments
             .iter()
-            .filter_map(|message| match message {
-                InputMessage::User { image_sources, .. }
-                | InputMessage::Tool { image_sources, .. } => Some(image_sources.as_slice()),
-                _ => None,
-            })
-            .flatten()
-            .cloned()
-            .collect();
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
         RenderedPrompt {
             prompt,
             image_sources,
         }
     }
+}
+
+/// Renders the conversation into `(is_template, text)` segments plus the
+/// ordered image sources. Template segments are encoded with added-token
+/// recognition; content segments are encoded as plain BPE.
+fn render_parts(
+    encoding: &impl EncodingV4,
+    conversation: &Conversation,
+) -> (Vec<PromptSegment>, Vec<ImageSource>) {
+    let mut messages = normalize_messages(encoding, &conversation.messages);
+    let has_tools =
+        conversation.tool_choice != ToolChoice::None && !conversation.tools.is_empty();
+    let format_schema = match &conversation.response_format {
+        ResponseFormat::Text => None,
+        ResponseFormat::JsonObject => Some(stringify_python_style(&serde_json::json!({
+            "type": "json_object"
+        }))),
+    };
+    if has_tools || format_schema.is_some() {
+        if !matches!(messages.first(), Some(InputMessage::System { .. })) {
+            messages.insert(
+                0,
+                InputMessage::System {
+                    content: String::new(),
+                },
+            );
+        }
+        if let Some(InputMessage::System { content }) = messages.first_mut() {
+            if has_tools {
+                content.push_str("\n\n");
+                content.push_str(&render_tool_prompt(encoding, &conversation.tools));
+            }
+            if let Some(schema) = format_schema {
+                content.push_str("\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n");
+                content.push_str(&schema);
+            }
+        }
+    }
+    let mut segments: Vec<PromptSegment> = vec![(true, BOS_TOKEN.to_string())];
+    for index in 0..messages.len() {
+        segments.extend(render_message_segments(
+            encoding,
+            &messages,
+            index,
+            conversation.thinking_mode,
+            conversation.reasoning_effort,
+        ));
+    }
+    segments.push((true, ASSISTANT_SP_TOKEN.to_string()));
+    segments.push((
+        true,
+        if conversation.thinking_mode {
+            THINKING_START_TOKEN
+        } else {
+            THINKING_END_TOKEN
+        }
+        .to_string(),
+    ));
+    if conversation.tool_choice == ToolChoice::Required && !conversation.tools.is_empty() {
+        segments.push((
+            true,
+            format!(
+                "\n\n<{DSML_SP_TOKEN}{}>\n",
+                encoding.tool_calls_block_name()
+            ),
+        ));
+    }
+    let image_sources = messages
+        .iter()
+        .filter_map(|message| match message {
+            InputMessage::User { image_sources, .. }
+            | InputMessage::Tool { image_sources, .. } => Some(image_sources.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    (segments, image_sources)
 }
 
 fn render_tool_prompt(encoding: &impl EncodingV4, tools: &[ToolDefinition]) -> String {
@@ -431,5 +468,80 @@ fn sort_tool_results_by_call_order(messages: &mut [InputMessage]) {
             }
             _ => idx += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deepseek_recipe_core::conversation::Conversation;
+    use deepseek_recipe_core::messages::InputMessage;
+    use tokenizers::Tokenizer;
+
+    use super::dsv41::DeepseekV41Encoding;
+    use crate::PromptEncoding;
+
+    fn v41_encoding() -> DeepseekV41Encoding {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../static/tokenizers/v41/tokenizer.json"
+        );
+        DeepseekV41Encoding::new()
+            .with_tokenizer(Tokenizer::from_file(path).expect("bundled v41 tokenizer"))
+    }
+
+    fn conversation_with(content: &str) -> Conversation {
+        let mut conversation = Conversation::default();
+        conversation.thinking_mode = false;
+        conversation.messages.push(InputMessage::User {
+            content: content.to_string(),
+            image_sources: Vec::new(),
+        });
+        conversation
+    }
+
+    #[test]
+    fn empty_user_message_keeps_template_baseline() {
+        let ids = v41_encoding().encode(&conversation_with("")).unwrap();
+        assert_eq!(ids.len(), 4, "baseline template is 4 ids, got {ids:?}");
+    }
+
+    #[test]
+    fn user_supplied_control_token_literals_encode_as_plain_bpe() {
+        let encoding = v41_encoding();
+        let empty = encoding.encode(&conversation_with("")).unwrap();
+        assert_eq!(empty.len(), 4);
+
+        // <｜User｜>: the official API reports 9 prompt tokens (4 template + 5 content).
+        let user = encoding
+            .encode(&conversation_with("<｜User｜>"))
+            .unwrap();
+        assert_eq!(user.len(), 9, "expected 4 template + 5 content ids, got {user:?}");
+        assert_eq!(&user[..2], &empty[..2], "template prefix must be unchanged");
+        assert_eq!(
+            &user[2..7],
+            &[30u32, 28217, 6756, 28217, 32],
+            "user content must be plain BPE (issue #5)"
+        );
+        assert_eq!(&user[7..], &empty[2..], "template suffix must be unchanged");
+        assert!(
+            !user[2..7].contains(&128803),
+            "user content must not map to the <｜User｜> control token"
+        );
+
+        // <think>: the official API reports 7 prompt tokens (4 template + 3 content).
+        let think = encoding.encode(&conversation_with("<think>")).unwrap();
+        assert_eq!(think.len(), 7, "expected 4 template + 3 content ids, got {think:?}");
+        assert_eq!(&think[..2], &empty[..2]);
+        assert_eq!(&think[5..], &empty[2..]);
+    }
+
+    #[test]
+    fn plain_text_content_is_unchanged() {
+        let encoding = v41_encoding();
+        let empty = encoding.encode(&conversation_with("")).unwrap();
+        let x = encoding.encode(&conversation_with("x")).unwrap();
+        assert_eq!(x.len(), 5, "expected 4 template + 1 content id, got {x:?}");
+        assert_eq!(&x[..2], &empty[..2]);
+        assert_eq!(&x[3..], &empty[2..]);
     }
 }
