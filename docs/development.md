@@ -94,7 +94,7 @@ After installing the native dependencies, create a virtual environment:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install 'maturin>=1.9,<2' 'pytest>=8,<10' httpx
+python3 -m pip install 'maturin>=1.9,<2' 'pytest>=8,<10' httpx -r server-py/requirements.txt
 maturin develop --manifest-path deepseek-recipe-python/Cargo.toml --locked
 python3 -m pytest deepseek-recipe-python/tests server-py/tests
 ```
