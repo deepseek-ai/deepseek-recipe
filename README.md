@@ -134,3 +134,14 @@ token IDs or decode backend token IDs, see
 
 Project code and public documentation are licensed under the [MIT License](LICENSE).
 Bundled tokenizer notices are in [static/tokenizers/README.md](static/tokenizers/README.md).
+
+---
+
+## ⚡ Production Notes: Migrating to V4.1 Flash
+
+> [!WARNING]  
+> Legacy model aliases `deepseek-chat` and `deepseek-reasoner` have been fully retired. Ensure your production environments and deployment configurations are explicitly updated to the current endpoints.
+
+### Quick Migration Specs
+* **Standard Chat/Code:** Upgrade your configuration files or API client parameters directly to `deepseek-v4-flash`.
+* **Reasoning (Chain-of-Thought):** Enable the native `thinking` mode parameters inside the API request body instead of relying on outdated separate model names.
