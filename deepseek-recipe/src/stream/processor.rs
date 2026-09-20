@@ -222,9 +222,17 @@ impl StashedChunks {
             OutputAction::Reasoning => {
                 non_empty(front_chunk).map(|content| OutputChunk::Reasoning { content })
             }
-            OutputAction::ToSpace => Some(OutputChunk::Raw {
-                content: " ".to_string(),
-            }),
+            OutputAction::ToSpace => {
+                // 与 Label/ToolCall* 相同的去重：一段连续替换的文本无论被后端
+                // 切成多少个 chunk，都只产出等宽的一处空白，输出不依赖分块边界。
+                if last_pop_action != OutputAction::ToSpace {
+                    Some(OutputChunk::Raw {
+                        content: " ".to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
             OutputAction::Skip | OutputAction::SkipInvalid { .. } => None,
             OutputAction::StopSequence => {
                 let content = front_chunk.unwrap_or_default();
@@ -365,5 +373,57 @@ fn escape_json_string(content: String) -> String {
     match serde_json::to_string(&content) {
         Ok(escaped) if escaped.len() > 2 => escaped[1..escaped.len() - 1].to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tospace_tests {
+    use super::*;
+    /// 直接收集 OutputChunk 的最小生成器，便于在无协议层时驱动流处理器。
+    struct Collector;
+
+    impl ChunkGenerator for Collector {
+        type Chunk = OutputChunk;
+
+        async fn generate(&mut self, chunk: OutputChunk) -> Vec<OutputChunk> {
+            vec![chunk]
+        }
+    }
+
+    async fn collect_raw_content(parts: &[&str]) -> String {
+        let inference = tokio_stream::iter(parts.iter().map(|content| InferenceChunk::Text {
+            content: (*content).to_string(),
+            content_tokens: 1,
+        }));
+        let processor = StreamProcessor::new(
+            Collector,
+            ParsingOptions {
+                parse_json_output: true,
+                ..Default::default()
+            },
+        );
+        let mut content = String::new();
+        let stream = processor.process(inference);
+        tokio::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(OutputChunk::Raw { content: text }) => content += &text,
+                Ok(_) => {}
+                Err(error) => panic!("stream error: {error:?}"),
+            }
+        }
+        content
+    }
+
+    /// JSON 模式下被替换为空白的文本段：无论后端如何分块，输出必须一致
+    /// （每个连续替换段恰好一个空格，而不是每个 chunk 一个空格）。
+    #[tokio::test]
+    async fn tospace_output_is_chunk_boundary_independent() {
+        let whole = collect_raw_content(&["aaaaabbbb```json\n{}"]).await;
+        let split = collect_raw_content(&["aaaaa", "bbbb```json\n{}"]).await;
+        assert_eq!(whole, split);
+        assert!(whole.contains(' '));
+        assert!(!whole.contains('a'));
+        assert!(!whole.contains('b'));
     }
 }
