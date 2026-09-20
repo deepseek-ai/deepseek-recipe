@@ -140,6 +140,19 @@ where
                     yield Ok(out);
                 }
             }
+            // 流结束时冲刷仍在缓冲的 token：尾部的替换字符（真实 U+FFFD 文本）
+            // 或截断序列不应从输出与用量里消失。
+            if let Some(decoder) = decoder.as_mut() {
+                if let Some((content, content_tokens)) = decoder.finish() {
+                    completion_usage.completion_tokens += content_tokens;
+                    let actions = state_machine.feed(&content);
+                    stashed.push(Some(content));
+                    for out in stashed.apply_actions(actions, &mut generator).await {
+                        yield Ok(out);
+                    }
+                    stop_sequence = stashed.take_stop_sequence();
+                }
+            }
             let actions = state_machine.finish();
             for out in stashed.apply_actions(actions, &mut generator).await {
                 yield Ok(out);
@@ -365,5 +378,68 @@ fn escape_json_string(content: String) -> String {
     match serde_json::to_string(&content) {
         Ok(escaped) if escaped.len() > 2 => escaped[1..escaped.len() - 1].to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod decoder_flush_tests {
+    use super::super::decoder::TokenizerDecoder;
+    use super::*;
+
+    struct ScriptedDecoder;
+
+    /// id 0 -> "a"；id 1 -> U+FFFD（真实文本里的替换字符，非多字节截断）。
+    impl TokenizerDecoder for ScriptedDecoder {
+        fn decode_ids(&self, ids: &[u32], _skip_special_tokens: bool) -> Result<String, String> {
+            Ok(ids
+                .iter()
+                .map(|id| match id {
+                    0 => "a",
+                    _ => "\u{FFFD}",
+                })
+                .collect())
+        }
+    }
+
+    struct Collector;
+
+    impl ChunkGenerator for Collector {
+        type Chunk = OutputChunk;
+
+        async fn generate(&mut self, chunk: OutputChunk) -> Vec<OutputChunk> {
+            vec![chunk]
+        }
+    }
+
+    /// 流末尾缓冲的 token 必须冲刷：结尾恰好是真实 U+FFFD 的文本不能
+    /// 从输出与 completion 用量里消失（此前启发式把它当作未完成字符而丢弃）。
+    #[tokio::test]
+    async fn trailing_replacement_character_is_flushed_at_end_of_stream() {
+        let inference = tokio_stream::iter(vec![
+            InferenceChunk::Token { token_id: 0 },
+            InferenceChunk::Token { token_id: 1 },
+            InferenceChunk::Finish {
+                finish_reason: InferenceFinishReason::Stop,
+            },
+        ]);
+        let processor = StreamProcessor::new(Collector, ParsingOptions::default())
+            .with_tokenizer(ScriptedDecoder);
+        let mut content = String::new();
+        let mut usage = None;
+        let stream = processor.process(inference);
+        tokio::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(OutputChunk::Raw { content: text }) => content += &text,
+                Ok(OutputChunk::Finish {
+                    usage: finish_usage,
+                    ..
+                }) => usage = Some(finish_usage),
+                Ok(_) => {}
+                Err(error) => panic!("stream error: {error:?}"),
+            }
+        }
+        assert_eq!(content, "a\u{FFFD}");
+        assert_eq!(usage.expect("finish event").completion_tokens, 2);
     }
 }

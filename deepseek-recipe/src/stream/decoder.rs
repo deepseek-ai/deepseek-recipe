@@ -68,4 +68,25 @@ impl StreamDecoder {
         self.ids.clear();
         Ok(Some((content, std::mem::take(&mut self.pending))))
     }
+
+    /// Flush any still-buffered ids at the end of the stream.
+    ///
+    /// The incompleteness heuristic cannot distinguish a multi-token character
+    /// still split across tokens from decoded text that legitimately ends with
+    /// U+FFFD (mojibake bytes decode to a real replacement character). At
+    /// end-of-stream there is no further token to disambiguate, so whatever
+    /// remains is emitted as-is — a genuinely truncated sequence yields its
+    /// replacement character, a legitimate one is no longer dropped.
+    pub fn finish(&mut self) -> Option<(String, usize)> {
+        if self.ids.is_empty() {
+            return None;
+        }
+        let content = self
+            .decoder
+            .decode_ids(&self.ids, false)
+            .ok()
+            .filter(|content| !content.is_empty())?;
+        self.ids.clear();
+        Some((content, std::mem::take(&mut self.pending)))
+    }
 }
