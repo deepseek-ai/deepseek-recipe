@@ -182,7 +182,10 @@ fn render_message(
                 _ => String::new(),
             };
             let mut thinking_part = String::new();
-            if thinking_mode && index > 0 {
+            // 历史轮里 assistant 携带的 reasoning_content 一律渲染：这里的 index
+            // 只是消息在数组中的位置，越过的 index > 0 守卫会让「首条恰为 assistant」
+            // 的历史丢掉其推理内容（是否有 system 前缀不应改变渲染结果）。
+            if thinking_mode {
                 if let Some(reasoning_content) = reasoning_content {
                     thinking_part += reasoning_content;
                 }
@@ -431,5 +434,49 @@ fn sort_tool_results_by_call_order(messages: &mut [InputMessage]) {
             }
             _ => idx += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod assistant_reasoning_tests {
+    use super::*;
+    use crate::v4::dsv41::DeepseekV41Encoding;
+    use deepseek_recipe_core::conversation::Conversation;
+    use deepseek_recipe_core::messages::InputMessage;
+
+    /// 首条消息即为带 reasoning 的 assistant 时，推理内容也必须进入提示词：
+    /// 渲染结果不应取决于会话是否恰好以其他消息开头。
+    #[test]
+    fn assistant_reasoning_at_first_position_is_rendered() {
+        let leading = Conversation {
+            messages: vec![
+                InputMessage::User {
+                    content: "hi".to_string(),
+                    image_sources: Vec::new(),
+                },
+                InputMessage::Assistant {
+                    content: "hello".to_string(),
+                    reasoning_content: Some("I should greet".to_string()),
+                    tool_calls: None,
+                },
+            ],
+            ..Conversation::default()
+        };
+        let first = Conversation {
+            messages: vec![InputMessage::Assistant {
+                content: "hello".to_string(),
+                reasoning_content: Some("I should greet".to_string()),
+                tool_calls: None,
+            }],
+            ..Conversation::default()
+        };
+        let encoding = DeepseekV41Encoding::default();
+        let with_leading = encoding.render_conversation(&leading).prompt;
+        let at_first = encoding.render_conversation(&first).prompt;
+        assert!(with_leading.contains("I should greet"));
+        assert!(
+            at_first.contains("I should greet"),
+            "assistant reasoning at index 0 must render identically: {at_first}"
+        );
     }
 }
