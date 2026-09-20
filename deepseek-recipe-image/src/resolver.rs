@@ -267,7 +267,11 @@ mod tests {
         // 34_000_000 个 base64 字符 ≈ 25.5MB 解码后大小，应按 base64 公式估算
         // 而不是把 base64 长度当作解码长度。
         let body = "A".repeat(34_000_000);
-        for header in ["data:image/webp;base64", "data:image/webp;BASE64", "data:image/webp; base64"] {
+        for header in [
+            "data:image/webp;base64",
+            "data:image/webp;BASE64",
+            "data:image/webp; base64",
+        ] {
             let data_url = format!("{header},{body}");
             assert_eq!(estimated_decoded_len(&data_url), 34_000_000 / 4 * 3);
         }
