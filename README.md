@@ -13,6 +13,15 @@ into responses in the corresponding format. Use these components to connect an
 inference backend to API services that support multiple formats. Model
 inference, tool execution, and HTTP transport must be provided externally.
 
+### Papers with Code results
+
+[![Papers with Code: SOTA on AIME 2026](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29232&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29232)
+[![Papers with Code: SOTA on CyberGym](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29241&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29241)
+[![Papers with Code: SOTA on DeepSWE](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29238&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29238)
+[![Papers with Code: #2 on AutomationBench](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29242&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29242)
+[![Papers with Code: #2 on BabyVision](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29244&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29244)
+[![Papers with Code: #2 on ProgramBench](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29239&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29239)
+
 [Getting started](#using-deepseek-recipe) · [Streaming response](docs/streaming.md) ·
 [Use with tokenizer](docs/tokenizer.md) · [License](#license)
 
