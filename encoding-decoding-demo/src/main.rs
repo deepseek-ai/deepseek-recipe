@@ -263,18 +263,23 @@ fn conversion_failed(error: ConversionError) -> DemoError {
     (status, Json(error.into_response()))
 }
 
-fn convert_request<T>(mut body: serde_json::Value) -> Result<ConversationRequest, DemoError>
+fn parse_request<T>(mut body: serde_json::Value) -> Result<T, DemoError>
 where
-    T: ProtocolRequest + DeserializeOwned,
+    T: DeserializeOwned,
 {
     // Requests use V4.1 prompt rendering and a default model name.
     if let Some(body) = body.as_object_mut() {
         body.entry("model")
             .or_insert_with(|| "encoding-decoding-demo".into());
     }
-    let request: T = serde_json::from_value(body)
-        .map_err(|err| bad_request(format!("invalid request body: {err}")))?;
-    request
+    serde_json::from_value(body).map_err(|err| bad_request(format!("invalid request body: {err}")))
+}
+
+fn convert_request<T>(body: serde_json::Value) -> Result<ConversationRequest, DemoError>
+where
+    T: ProtocolRequest + DeserializeOwned,
+{
+    parse_request::<T>(body)?
         .convert(ConversionOptions::default())
         .map_err(conversion_failed)
 }
@@ -301,18 +306,24 @@ async fn render_handler(
     Ok(Json(RenderResponse { prompt, segments }))
 }
 
-async fn decode_output<T>(request: DecodeRequest) -> Result<serde_json::Value, DemoError>
+async fn decode_output<T>(
+    mut converted: ConversationRequest,
+    output: &str,
+    finish_reason: DecodeFinishReason,
+    configure_generator: impl FnOnce(
+        <T::Response as ProtocolResponse>::ChunkGenerator,
+    ) -> <T::Response as ProtocolResponse>::ChunkGenerator,
+) -> Result<serde_json::Value, DemoError>
 where
-    T: ProtocolRequest + DeserializeOwned,
+    T: ProtocolRequest,
     <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Send,
 {
-    let mut converted = convert_request::<T>(request.body)?;
     // This endpoint always accumulates a complete response, including usage,
     // even when the input request originally selected streaming transport.
     converted.stream = false;
-    let (output, finish_reason) = match request.output.split_once(EOS_TOKEN) {
+    let (output, finish_reason) = match output.split_once(EOS_TOKEN) {
         Some((output, _)) => (output, InferenceFinishReason::Stop),
-        None => (request.output.as_str(), request.finish_reason.into()),
+        None => (output, finish_reason.into()),
     };
     // The demo accepts complete assistant output. Consume its leading frame
     // markers here; the stream parser normally starts after a prompt prefill.
@@ -332,7 +343,7 @@ where
         .clone()
         .unwrap_or_else(|| "encoding-decoding-demo".into());
     let id = "demo-id".to_owned();
-    let generator = T::chunk_generator(&converted, id.clone(), model.clone());
+    let generator = configure_generator(T::chunk_generator(&converted, id.clone(), model.clone()));
     let processor = StreamProcessor::new(generator, converted.parsing_options);
     let inference = tokio_stream::iter([
         InferenceChunk::Text {
@@ -363,9 +374,38 @@ async fn decode_handler(
 ) -> Result<Json<DecodeResponse>, DemoError> {
     let segments = segment(&request.output);
     let response = match request.format {
-        ApiFormat::ChatCompletions => decode_output::<ChatCompletionRequest>(request).await?,
-        ApiFormat::Responses => decode_output::<ResponsesRequest>(request).await?,
-        ApiFormat::Messages => decode_output::<MessagesRequest>(request).await?,
+        ApiFormat::ChatCompletions => {
+            decode_output::<ChatCompletionRequest>(
+                convert_request::<ChatCompletionRequest>(request.body)?,
+                &request.output,
+                request.finish_reason,
+                |generator| generator,
+            )
+            .await?
+        }
+        ApiFormat::Responses => {
+            let body = parse_request::<ResponsesRequest>(request.body)?;
+            let custom_tool_names = body.custom_tool_names();
+            let converted = body
+                .convert(ConversionOptions::default())
+                .map_err(conversion_failed)?;
+            decode_output::<ResponsesRequest>(
+                converted,
+                &request.output,
+                request.finish_reason,
+                |generator| generator.with_custom_tool_names(custom_tool_names),
+            )
+            .await?
+        }
+        ApiFormat::Messages => {
+            decode_output::<MessagesRequest>(
+                convert_request::<MessagesRequest>(request.body)?,
+                &request.output,
+                request.finish_reason,
+                |generator| generator,
+            )
+            .await?
+        }
     };
     Ok(Json(DecodeResponse { response, segments }))
 }
@@ -415,3 +455,6 @@ async fn main() {
     println!("deepseek-recipe demo page: http://{addr}");
     axum::serve(listener, app).await.unwrap();
 }
+
+#[cfg(test)]
+mod decode_custom_tool_regression;
