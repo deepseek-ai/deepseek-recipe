@@ -20,11 +20,11 @@ use crate::request::{
 use crate::stream::state_machine::{ParsingOptions, ReasoningStage};
 
 use super::schema::{
-    ResponsesContentBlock, ResponsesInput, ResponsesInputImage, ResponsesInputItem,
-    ResponsesInputMessage, ResponsesMessageContent, ResponsesMessageRole, ResponsesReasoningEffort,
-    ResponsesReasoningItem, ResponsesRequest, ResponsesTextConfig, ResponsesTextFormat,
-    ResponsesTool, ResponsesToolCallOutputContent, ResponsesToolCallOutputItem,
-    ResponsesTypedInputItem,
+    ResponsesAgentMessage, ResponsesContentBlock, ResponsesInput, ResponsesInputImage,
+    ResponsesInputItem, ResponsesInputMessage, ResponsesMessageContent, ResponsesMessageRole,
+    ResponsesReasoningEffort, ResponsesReasoningItem, ResponsesRequest, ResponsesTextConfig,
+    ResponsesTextFormat, ResponsesTool, ResponsesToolCallOutputContent,
+    ResponsesToolCallOutputItem, ResponsesTypedInputItem,
 };
 use super::tools::ResponsesToolSet;
 
@@ -124,6 +124,14 @@ fn item_contains_image_special_token(item: &ResponsesInputItem) -> bool {
         ResponsesInputItem::Typed(typed) => match typed {
             ResponsesTypedInputItem::Message(message) => {
                 message_content_contains_image_special_token(&message.content)
+            }
+            ResponsesTypedInputItem::AgentMessage(message) => {
+                message.author.contains(IMAGE_SPECIAL_TOKEN)
+                    || message.recipient.contains(IMAGE_SPECIAL_TOKEN)
+                    || message.content.iter().any(|block| {
+                        matches!(block, ResponsesContentBlock::InputText { text }
+                            if text.contains(IMAGE_SPECIAL_TOKEN))
+                    })
             }
             ResponsesTypedInputItem::FunctionCallOutput(output) => {
                 output_content_contains_image_special_token(&output.output)
@@ -373,6 +381,42 @@ fn push_message(
     Ok(())
 }
 
+impl ResponsesAgentMessage {
+    /// Preserve incoming agent content as user input with explicit attribution.
+    fn into_user_message(self, item_idx: usize) -> Result<ResponsesInputMessage, ConversionError> {
+        let path = format!("input[{item_idx}]");
+        if self.author.trim().is_empty() || self.recipient.trim().is_empty() {
+            return Err(ConversionError::bad_request(format!(
+                "{path}: agent_message requires a non-empty author and recipient",
+            )));
+        }
+        let mut texts = Vec::with_capacity(self.content.len());
+        for (block_idx, block) in self.content.into_iter().enumerate() {
+            match block {
+                ResponsesContentBlock::InputText { text } => texts.push(text),
+                _ => {
+                    return Err(ConversionError::bad_request(format!(
+                        "{path}.content[{block_idx}]: agent_message supports only plaintext input_text content",
+                    )));
+                }
+            }
+        }
+        let text = texts.join("\n");
+        if text.trim().is_empty() {
+            return Err(ConversionError::bad_request(format!(
+                "{path}: agent_message requires non-empty plaintext content",
+            )));
+        }
+        Ok(ResponsesInputMessage {
+            role: ResponsesMessageRole::User,
+            content: ResponsesMessageContent::String(format!(
+                "Agent message from {} to {}:\n{text}",
+                self.author, self.recipient,
+            )),
+        })
+    }
+}
+
 fn push_reasoning(reasoning: ResponsesReasoningItem, messages: &mut Vec<InputMessage>) {
     let text = reasoning
         .content
@@ -432,6 +476,11 @@ fn transform_input_items(
                     check_pending_calls(&pending_call_ids)?;
                     append_tool_call_group(&mut pending_group, messages);
                     push_message(msg, item_idx, messages)?;
+                }
+                ResponsesTypedInputItem::AgentMessage(msg) => {
+                    check_pending_calls(&pending_call_ids)?;
+                    append_tool_call_group(&mut pending_group, messages);
+                    push_message(msg.into_user_message(item_idx)?, item_idx, messages)?;
                 }
                 ResponsesTypedInputItem::Reasoning(reasoning) => {
                     check_pending_calls(&pending_call_ids)?;

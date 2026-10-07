@@ -58,6 +58,7 @@ impl<'de> Deserialize<'de> for ResponsesInputItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesTypedInputItem {
     Message(ResponsesInputMessage),
+    AgentMessage(ResponsesAgentMessage),
     FunctionCall(ResponsesFunctionCall),
     FunctionCallOutput(ResponsesFunctionCallOutput),
     Reasoning(ResponsesReasoningItem),
@@ -66,6 +67,15 @@ pub enum ResponsesTypedInputItem {
     /// Unsupported item types, including `web_search_call`, are ignored.
     #[serde(other)]
     Unsupported,
+}
+
+/// A Codex agent-to-agent input item. Only plaintext `input_text` blocks are
+/// supported; encrypted or other content is rejected during conversion.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesAgentMessage {
+    pub author: String,
+    pub recipient: String,
+    pub content: Vec<ResponsesContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]

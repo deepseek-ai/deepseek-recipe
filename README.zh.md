@@ -19,6 +19,7 @@ deepseek-recipe 包含一套 Rust 库以及对应的 Python bindings：支持将
 - **输出解析：** 思考、工具调用、JSON object 输出和 stop sequence。
 - **图片：** 支持以 base64 或外部 URL 传入。提供基于 OpenCV 的 DeepSeek V4.1 图片预处理。
 - **工具定义：** 支持函数工具；Responses API 还支持工具命名空间和 `apply_patch` 自定义工具。
+- **Codex Agent 输入：** Responses 中包含明文 `input_text` 的 `agent_message` 会转换为注明发送者和接收者的用户消息。加密、混合、空白或非文本的 Agent 内容在转换时被拒绝。
 
 ## 尚未支持
 

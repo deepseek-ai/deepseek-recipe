@@ -29,6 +29,9 @@ inference, tool execution, and HTTP transport must be provided externally.
   DeepSeek V4.1 preprocessing with OpenCV.
 - **Tool definitions:** Function tools; the Responses API also supports tool
   namespaces and the `apply_patch` custom tool.
+- **Codex agent input:** Responses `agent_message` items with plaintext `input_text`
+  content are preserved as user messages with sender and recipient attribution.
+  Encrypted, mixed, empty, or non-text agent content is rejected during conversion.
 
 ## Not yet supported
 
