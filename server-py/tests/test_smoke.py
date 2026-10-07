@@ -83,6 +83,38 @@ def test_custom_inference():
     assert response_text("/v1/responses", response.json()) == "Custom answer"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_agent_input_reaches_inference_and_unreadable_content_does_not(stream):
+    prompts = []
+
+    async def infer(request):
+        prompts.append(request.prompt)
+        assert "from /root/worker to /root" in request.prompt
+        assert "CHILD_RESULT_92714" in request.prompt
+        yield InferenceChunk.text(THINKING_END_TOKEN + "Agent result received")
+
+    item = {
+        "type": "agent_message",
+        "author": "/root/worker",
+        "recipient": "/root",
+        "content": [{"type": "input_text", "text": "CHILD_RESULT_92714"}],
+    }
+    with TestClient(SERVER.create_app(infer)) as client:
+        accepted = client.post("/v1/responses", json={
+            "model": "test-model", "input": [item], "stream": stream,
+        })
+        assert accepted.status_code == 200, accepted.text
+        assert "Agent result received" in accepted.text
+        encrypted = {"type": "encrypted_content", "encrypted_content": "secret-ciphertext"}
+        for content in [[encrypted], [*item["content"], encrypted]]:
+            rejected = client.post("/v1/responses", json={
+                "model": "test-model", "input": [{**item, "content": content}], "stream": stream,
+            })
+            assert rejected.status_code == 400, rejected.text
+            assert "secret-ciphertext" not in rejected.text
+    assert len(prompts) == 1
+
+
 def test_invalid_request():
     with TestClient(SERVER.app) as client:
         response = client.post("/v1/chat/completions", json={})
