@@ -83,6 +83,21 @@ impl ResponsesToolSet {
             model_version,
             response_options: ResponseOptions::default(),
         };
+        if let Some(ResponsesInput::Items(items)) = input {
+            converted
+                .top_level_names
+                .extend(items.iter().filter_map(|item| match item {
+                    ResponsesInputItem::Typed(ResponsesTypedInputItem::FunctionCall(call))
+                        if call.namespace.is_none() =>
+                    {
+                        Some(call.name.clone())
+                    }
+                    ResponsesInputItem::Typed(ResponsesTypedInputItem::CustomToolCall(call)) => {
+                        Some(call.name.clone())
+                    }
+                    _ => None,
+                }));
+        }
         for (item_index, tools) in groups {
             let start = converted.client_tools.len();
             for (index, tool) in tools.into_iter().enumerate() {
