@@ -78,6 +78,8 @@ pub(crate) enum JsonSchemaType {
         format: Option<StringFormat>,
         #[serde(skip_serializing_if = "Option::is_none")]
         r#enum: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        r#const: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Number {
@@ -121,6 +123,8 @@ pub(crate) enum JsonSchemaType {
     Boolean {
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        r#const: Option<bool>,
     },
     #[serde(rename_all = "camelCase")]
     Array {
@@ -362,5 +366,30 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn primitive_constants_survive_normalization() {
+        for property in [
+            serde_json::json!({"type":"string","const":"fixed"}),
+            serde_json::json!({"type":"boolean","const":true}),
+        ] {
+            let result = normalize_strict_schema(
+                serde_json::json!({"type":"object","properties":{"value":property.clone()}}),
+                true,
+                |e| e.to_string(),
+                "root",
+            )
+            .unwrap();
+            assert_eq!(result["properties"]["value"], property);
+            let validator = jsonschema::options().offline().build(&result).unwrap();
+            assert!(validator.is_valid(&serde_json::json!({"value":property["const"]})));
+            assert!(!validator.is_valid(&serde_json::json!({"value":if property["type"] == "string" {serde_json::json!("other")} else {serde_json::json!(false)}})));
+        }
     }
 }
