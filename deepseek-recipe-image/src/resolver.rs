@@ -289,16 +289,54 @@ fn estimated_decoded_len(data_url: &str) -> usize {
     let Some((header, body)) = data_url.split_once(',') else {
         return 0;
     };
-    if header.ends_with(";base64") {
+    if is_base64_header(header) {
         body.len() / 4 * 3
     } else {
         body.len().saturating_sub(2 * body.matches('%').count())
     }
 }
 
+/// Whether the data URL header declares a base64 body.
+///
+/// `DataUrl::process` accepts the marker ASCII-case-insensitively with
+/// optional surrounding spaces (`;BASE64`, `; base64`); an exact
+/// `ends_with(";base64")` compare took the percent-encoding branch for those
+/// and estimated the raw base64 length (about 4/3 of the decoded size),
+/// falsely rejecting in-limit images near the top of the allowed range.
+fn is_base64_header(header: &str) -> bool {
+    header
+        .rsplit_once(';')
+        .is_some_and(|(_, param)| param.trim().eq_ignore_ascii_case("base64"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn base64_marker_detection_matches_the_parser() {
+        // 与 data-url crate 的解析一致：大小写不敏感、允许分号后空格。
+        assert!(is_base64_header("data:image/webp;base64"));
+        assert!(is_base64_header("data:image/webp;BASE64"));
+        assert!(is_base64_header("data:image/webp; base64"));
+        assert!(!is_base64_header("data:image/webp"));
+        assert!(!is_base64_header("data:image/webp;charset=utf8"));
+    }
+
+    #[test]
+    fn estimated_decoded_len_uses_base64_math_for_case_or_space_variants() {
+        // 34_000_000 个 base64 字符 ≈ 25.5MB 解码后大小，应按 base64 公式估算
+        // 而不是把 base64 长度当作解码长度。
+        let body = "A".repeat(34_000_000);
+        for header in [
+            "data:image/webp;base64",
+            "data:image/webp;BASE64",
+            "data:image/webp; base64",
+        ] {
+            let data_url = format!("{header},{body}");
+            assert_eq!(estimated_decoded_len(&data_url), 34_000_000 / 4 * 3);
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use deepseek_recipe_core::multimodal::{ImageDetail, ImageInfo};
