@@ -28,7 +28,7 @@ pub(crate) enum JsonSchema {
     #[serde(rename_all = "camelCase")]
     #[untagged_deserialize(field = "anyOf")]
     AnyOf {
-        any_of: Vec<JsonSchemaType>,
+        any_of: Vec<JsonSchema>,
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
@@ -362,5 +362,21 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn anyof_accepts_references_and_nested_unions() {
+        let input = serde_json::json!({"type":"object","properties":{"value":{"anyOf":[{"$ref":"#/properties/base"},{"anyOf":[{"type":"string"},{"type":"null"}]}]},"base":{"type":"integer"}}});
+        let result = normalize_strict_schema(input, true, |e| e.to_string(), "root").unwrap();
+        assert_eq!(
+            result["properties"]["value"]["anyOf"][0]["$ref"],
+            "#/properties/base"
+        );
+        assert!(validate_schema(&result).is_ok());
     }
 }
