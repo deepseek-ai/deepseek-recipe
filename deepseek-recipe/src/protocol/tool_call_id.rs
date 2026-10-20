@@ -36,12 +36,23 @@ pub(crate) fn new_tool_call_id(index: usize, empty_thinking: bool) -> String {
 
 /// Return whether `id` carries the empty-thinking marker.
 ///
-/// An ASCII `id` carries the marker when its bytes at zero-based offsets 8
-/// to 10 are `ET_`, the position in IDs from [`new_tool_call_id`], or, for an
-/// ID whose underscores were removed (`call00ET…`), when its bytes at offsets
-/// 6 and 7 are `ET`.
+/// The marker follows the complete decimal index, whose width is at least
+/// two digits. IDs whose underscores were removed are accepted as well.
 pub(crate) fn is_empty_thinking_tool_call_id(id: &str) -> bool {
-    id.is_ascii() && ((id.len() > 10 && &id[8..11] == "ET_") || (id.len() > 7 && &id[6..8] == "ET"))
+    if !id.is_ascii() {
+        return false;
+    }
+    if let Some(rest) = id.strip_prefix("call_") {
+        return rest.split_once('_').is_some_and(|(index, tail)| {
+            index.len() >= 2
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && tail.starts_with("ET_")
+        });
+    }
+    id.strip_prefix("call").is_some_and(|rest| {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits >= 2 && rest[digits..].starts_with("ET")
+    })
 }
 
 #[cfg(test)]
@@ -70,5 +81,22 @@ mod tests {
     fn foreign_ids_are_not_marked() {
         assert!(!is_empty_thinking_tool_call_id("toolu_123"));
         assert!(!is_empty_thinking_tool_call_id(""));
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn generated_large_indexes_keep_the_marker() {
+        for index in [0, 99, 100, 1000, usize::MAX] {
+            let id = new_tool_call_id(index, true);
+            assert!(is_empty_thinking_tool_call_id(&id), "{id}");
+            assert!(is_empty_thinking_tool_call_id(&id.replace('_', "")), "{id}");
+            assert!(!is_empty_thinking_tool_call_id(&new_tool_call_id(
+                index, false
+            )));
+        }
     }
 }
