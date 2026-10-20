@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: Core crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select the pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test protocol and encoding crates
+        run: >-
+          cargo test
+          -p deepseek-recipe-core
+          -p deepseek-recipe
+          -p deepseek-recipe-encoding
+          -p encoding-decoding-demo
+          --locked
+      - name: Check image crate without native preprocessing
+        run: cargo check -p deepseek-recipe-image --no-default-features --locked
+
+  workspace:
+    name: Full workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config python3-dev
+      - name: Build minimal OpenCV 4.12
+        env:
+          OPENCV_SOURCE: ${{ runner.temp }}/opencv-source
+          OPENCV_PREFIX: ${{ github.workspace }}/target/opencv-min
+        run: |
+          git init "$OPENCV_SOURCE"
+          git -C "$OPENCV_SOURCE" remote add origin https://github.com/opencv/opencv.git
+          git -C "$OPENCV_SOURCE" fetch --depth 1 origin 49486f61fb25722cbcf586b7f4320921d46fb38e
+          git -C "$OPENCV_SOURCE" checkout --detach FETCH_HEAD
+          cmake -S "$OPENCV_SOURCE" -B "$OPENCV_SOURCE/build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$OPENCV_PREFIX" \
+            -DBUILD_SHARED_LIBS=ON -DBUILD_LIST=core,imgproc,imgcodecs \
+            -DOPENCV_GENERATE_PKGCONFIG=ON \
+            -DBUILD_ZLIB=ON -DBUILD_JPEG=ON -DBUILD_PNG=ON -DBUILD_WEBP=ON \
+            -DWITH_JPEG=ON -DWITH_PNG=ON -DWITH_WEBP=ON \
+            -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+            -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF -DBUILD_JAVA=OFF \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF -DBUILD_PROTOBUF=OFF \
+            -DWITH_ADE=OFF -DWITH_EIGEN=OFF -DWITH_FFMPEG=OFF -DWITH_GSTREAMER=OFF \
+            -DWITH_GTK=OFF -DWITH_IPP=OFF -DWITH_ITT=OFF -DWITH_JASPER=OFF \
+            -DWITH_CUDA=OFF -DWITH_LAPACK=OFF -DWITH_OPENCL=OFF -DWITH_OPENCLAMDBLAS=OFF \
+            -DWITH_OPENCLAMDFFT=OFF -DWITH_OPENEXR=OFF -DWITH_OPENJPEG=OFF \
+            -DWITH_OPENMP=OFF -DWITH_QUIRC=OFF -DWITH_TBB=OFF -DWITH_TIFF=OFF \
+            -DWITH_V4L=OFF -DWITH_1394=OFF
+          cmake --build "$OPENCV_SOURCE/build" --parallel 2
+          cmake --install "$OPENCV_SOURCE/build"
+          echo "OPENCV_INCLUDE_PATHS=$OPENCV_PREFIX/include/opencv4" >> "$GITHUB_ENV"
+          echo "OPENCV_LINK_PATHS=$OPENCV_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "OPENCV_LINK_LIBS=opencv_core,opencv_imgproc,opencv_imgcodecs" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=-L$OPENCV_PREFIX/lib -C link-arg=-Wl,-rpath,$OPENCV_PREFIX/lib" >> "$GITHUB_ENV"
+      - name: Expose OpenCV to documentation test executables
+        run: echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/target/opencv-min/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      - name: Select the pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Build API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
