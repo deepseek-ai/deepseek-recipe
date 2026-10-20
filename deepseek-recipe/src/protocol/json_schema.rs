@@ -62,9 +62,11 @@ pub(crate) enum JsonSchemaType {
         required: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        // Only `$def` is retained. Deserialization ignores the standard
-        // `$defs` and `definitions` keywords, so normalization drops them,
-        // while a `$ref` into them is kept unchanged.
+        // Retain legacy `$def` as well as the standard definition containers.
+        #[serde(rename = "$defs", skip_serializing_if = "Option::is_none")]
+        defs: Option<Box<IndexMap<String, Box<JsonSchema>>>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        definitions: Option<Box<IndexMap<String, Box<JsonSchema>>>>,
         #[serde(rename = "$def", skip_serializing_if = "Option::is_none")]
         def: Option<IndexMap<String, Box<JsonSchema>>>,
     },
@@ -180,6 +182,8 @@ impl Default for JsonSchema {
             required: Some(vec![]),
             description: None,
             def: None,
+            defs: None,
+            definitions: None,
         })
     }
 }
@@ -192,6 +196,8 @@ impl JsonSchemaType {
                 required,
                 additional_properties,
                 def,
+                defs,
+                definitions,
                 ..
             } => {
                 let mut properties = raw_properties.take().unwrap_or_default();
@@ -203,8 +209,12 @@ impl JsonSchemaType {
                 for value in properties.values_mut() {
                     value.normalize(false)?;
                 }
-                if let Some(def) = def {
-                    for value in def.values_mut() {
+                for definitions in def
+                    .iter_mut()
+                    .chain(defs.iter_mut().map(Box::as_mut))
+                    .chain(definitions.iter_mut().map(Box::as_mut))
+                {
+                    for value in definitions.values_mut() {
                         value.normalize(false)?;
                     }
                 }
@@ -362,5 +372,25 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn standard_definitions_are_retained_and_normalized() {
+        for keyword in ["$defs", "definitions"] {
+            let mut input = serde_json::json!({"type":"object", "properties":{"value":{"$ref":format!("#/{keyword}/Entry")}}});
+            input[keyword] = serde_json::json!({"Entry":{"type":"object", "properties":{"name":{"type":"string"}}}});
+            let result = normalize_strict_schema(input, true, |e| e.to_string(), "root").unwrap();
+            assert_eq!(
+                result[keyword]["Entry"]["required"],
+                serde_json::json!(["name"])
+            );
+            assert_eq!(result[keyword]["Entry"]["additionalProperties"], false);
+            assert!(validate_schema(&result).is_ok(), "{result}");
+        }
     }
 }
