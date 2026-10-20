@@ -189,7 +189,8 @@ impl ConversationRequest {
     /// [`DEFAULT_MAX_EFFORT_MAX_TOKENS`] in thinking mode with
     /// [`ReasoningEffort::Max`], and [`DEFAULT_THINKING_MAX_TOKENS`] in thinking
     /// mode otherwise. The result is lowered to the context left after the
-    /// prompt and raised to at least 1.
+    /// prompt and raised to at least 1; when no context remains at all, the
+    /// request is rejected instead.
     ///
     /// Call it after encoding the prompt; conversion cannot count prompt
     /// tokens.
@@ -226,6 +227,17 @@ impl ConversationRequest {
             DEFAULT_THINKING_MAX_TOKENS
         };
         let remaining = context_limit - prompt_tokens;
+        // A prompt that fills the context leaves no room for output. Raise the same
+        // BadRequest an explicit over-limit request gets instead of flooring the
+        // implicit budget to a phantom token: the backend would reject that request
+        // anyway, and with a less precise error.
+        if remaining == 0 {
+            return Err(ConversionError::bad_request(format!(
+                "This model's maximum context length is {context_limit} tokens. However, you \
+                 requested {prompt_tokens} tokens ({prompt_tokens} in the messages, 0 in the \
+                 completion). Please reduce the length of the messages or completion."
+            )));
+        }
         Ok(self
             .inference_options
             .max_tokens
@@ -289,3 +301,35 @@ impl std::fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(max_tokens: Option<u32>) -> ConversationRequest {
+        let mut request =
+            ConversationRequest::new(Conversation::default(), ModelVersion::DeepseekV41Flash);
+        request.inference_options.max_tokens = max_tokens;
+        request
+    }
+
+    #[test]
+    fn resolve_max_tokens_raises_bad_request_when_prompt_fills_context() {
+        // Prompt fills the context and the request sets no limit: the default used
+        // to be floored to one output token, which the backend rejects anyway.
+        let err = request(None).resolve_max_tokens(100, 100).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("maximum context length is 100 tokens"),
+            "unexpected detail: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_max_tokens_keeps_explicit_and_implicit_budgets_below_the_limit() {
+        assert_eq!(request(None).resolve_max_tokens(99, 100).unwrap(), 1);
+        assert_eq!(request(Some(1)).resolve_max_tokens(99, 100).unwrap(), 1);
+        assert_eq!(request(None).resolve_max_tokens(10, 100).unwrap(), 90);
+        assert_eq!(request(Some(50)).resolve_max_tokens(10, 100).unwrap(), 50);
+    }
+}
