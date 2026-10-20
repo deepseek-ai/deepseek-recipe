@@ -75,7 +75,7 @@ pub(crate) enum JsonSchemaType {
         #[serde(skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        format: Option<StringFormat>,
+        format: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         r#enum: Option<Vec<String>>,
     },
@@ -133,17 +133,6 @@ pub(crate) enum JsonSchemaType {
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
-}
-
-/// A `format` keyword value retained for a string schema.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum StringFormat {
-    Email,
-    Hostname,
-    Ipv4,
-    Ipv6,
-    Uuid,
 }
 
 impl JsonSchema {
@@ -362,5 +351,25 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn string_formats_are_not_limited_to_a_small_enum() {
+        for format in [
+            "date-time",
+            "date",
+            "time",
+            "uri",
+            "duration",
+            "custom-format",
+        ] {
+            let result = normalize_strict_schema(serde_json::json!({"type":"object","properties":{"value":{"type":"string","format":format}}}), true, |e|e.to_string(), "root").unwrap();
+            assert_eq!(result["properties"]["value"]["format"], format);
+        }
     }
 }
