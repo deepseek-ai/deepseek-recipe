@@ -175,8 +175,8 @@ where
                     }
                     started = true;
                 }
+                completion_usage.completion_tokens += pieces.iter().map(|piece| piece.token_count).sum::<usize>();
                 for piece in pieces {
-                    completion_usage.completion_tokens += piece.token_count;
                     let actions = parser.feed(&piece.content, piece.kind);
                     pending.push(piece.content, piece.logprobs);
                     for protocol_chunk in pending.apply_actions(actions, &mut generator).await {
@@ -1141,5 +1141,59 @@ mod tests {
         assert_eq!(reasoning(&output), "\u{FFFD}");
         assert_eq!(content(&output), "");
         assert_eq!(finish_chunk(&output).2.completion_tokens, 2);
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_usage_includes_remaining_pieces_of_the_same_chunk() {
+        #[derive(Debug)]
+        struct Pieces;
+        impl StreamTokenizer for Pieces {
+            fn decode_ids(&self, ids: &[u32], _: bool) -> Result<String, String> {
+                Ok(ids
+                    .iter()
+                    .map(|id| match id {
+                        0 => "STOP",
+                        1 => "<special>",
+                        _ => "tail",
+                    })
+                    .collect())
+            }
+            fn is_special_token(&self, id: u32) -> bool {
+                id == 1
+            }
+        }
+        struct Pass;
+        impl ChunkGenerator for Pass {
+            type Chunk = OutputChunk;
+            async fn generate(&mut self, chunk: OutputChunk) -> Vec<Self::Chunk> {
+                vec![chunk]
+            }
+        }
+        let processor = StreamProcessor::new(
+            Pass,
+            ParsingOptions {
+                stop_sequences: vec!["STOP".into()],
+                ..Default::default()
+            },
+        )
+        .with_tokenizer(Pieces);
+        let output: Vec<_> = processor
+            .into_protocol_stream(tokio_stream::iter(vec![InferenceChunk::Tokens {
+                token_ids: vec![0, 1, 2],
+                logprobs: None,
+            }]))
+            .collect()
+            .await;
+        match output.last().unwrap().as_ref().unwrap() {
+            OutputChunk::Finish {
+                completion_usage, ..
+            } => assert_eq!(completion_usage.completion_tokens, 3),
+            other => panic!("{other:?}"),
+        }
     }
 }
