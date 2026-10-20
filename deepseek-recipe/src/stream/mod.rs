@@ -15,6 +15,8 @@ mod inference;
 mod logprobs;
 mod output_parser;
 mod processor;
+#[cfg(test)]
+mod split_coverage_tests;
 
 /// An error that ends stream processing before normal completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
