@@ -103,19 +103,19 @@ pub(crate) enum JsonSchemaType {
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        r#const: Option<i64>,
+        r#const: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        default: Option<i64>,
+        default: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        minimum: Option<i64>,
+        minimum: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        maximum: Option<i64>,
+        maximum: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        exclusive_minimum: Option<i64>,
+        exclusive_minimum: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        exclusive_maximum: Option<i64>,
+        exclusive_maximum: Option<serde_json::Number>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        multiple_of: Option<i64>,
+        multiple_of: Option<serde_json::Number>,
     },
     #[serde(rename_all = "camelCase")]
     Boolean {
@@ -362,5 +362,29 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn integer_bounds_can_be_fractional_or_unsigned() {
+        for bounds in [
+            serde_json::json!({"minimum":0.5,"maximum":10.5}),
+            serde_json::json!({"maximum":18446744073709551615u64}),
+        ] {
+            let mut property = bounds;
+            property["type"] = serde_json::json!("integer");
+            let result = normalize_strict_schema(
+                serde_json::json!({"type":"object","properties":{"n":property.clone()}}),
+                true,
+                |e| e.to_string(),
+                "root",
+            )
+            .unwrap();
+            assert_eq!(result["properties"]["n"], property);
+        }
     }
 }
