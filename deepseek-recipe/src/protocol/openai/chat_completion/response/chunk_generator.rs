@@ -81,14 +81,9 @@ impl ChatCompletionChunkGenerator {
         finish_reason: Option<ChatCompletionFinishReason>,
         usage: Option<ChatCompletionUsage>,
     ) -> Vec<ChatCompletionChunk> {
-        // Include null usage before the final snapshot when requested. Otherwise the
-        // final chunk includes usage.
-        let usage = if self.include_usage {
-            Some(usage)
-        } else {
-            usage.map(Some)
-        };
-        vec![ChatCompletionChunk {
+        let final_usage = usage;
+        let usage = self.include_usage.then_some(None);
+        let mut chunks = vec![ChatCompletionChunk {
             id: self.response_id.clone(),
             object: CHAT_COMPLETION_CHUNK_OBJECT,
             created: self.created,
@@ -101,7 +96,21 @@ impl ChatCompletionChunkGenerator {
                 finish_reason,
             }],
             usage,
-        }]
+        }];
+        if self.include_usage
+            && let Some(usage) = final_usage
+        {
+            chunks.push(ChatCompletionChunk {
+                id: self.response_id.clone(),
+                object: CHAT_COMPLETION_CHUNK_OBJECT,
+                created: self.created,
+                model: self.model.clone(),
+                system_fingerprint: self.system_fingerprint.clone(),
+                choices: Vec::new(),
+                usage: Some(Some(usage)),
+            });
+        }
+        chunks
     }
 }
 
@@ -266,5 +275,58 @@ mod tests {
     async fn non_thinking_tool_call_is_not_marked() {
         let id = first_tool_call_id(false, None).await;
         assert!(!is_empty_thinking_tool_call_id(&id));
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn requested_usage_has_a_separate_empty_choice_chunk() {
+        let mut generator =
+            ChatCompletionChunkGenerator::new("id".into(), "model".into(), true, false);
+        let chunks = generator
+            .generate(OutputChunk::Finish {
+                finish_reason: crate::stream::FinishReason::Stop,
+                stop_sequence: None,
+                completion_usage: crate::stream::CompletionUsage {
+                    completion_tokens: 7,
+                    reasoning_tokens: None,
+                },
+            })
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(chunks[0].usage, Some(None)));
+        assert_eq!(
+            chunks[0].choices[0].finish_reason,
+            Some(ChatCompletionFinishReason::Stop)
+        );
+        assert!(chunks[1].choices.is_empty());
+        assert_eq!(
+            chunks[1]
+                .usage
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .completion_tokens,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_omitted_when_not_requested() {
+        let mut generator =
+            ChatCompletionChunkGenerator::new("id".into(), "model".into(), false, false);
+        let chunks = generator
+            .generate(OutputChunk::Finish {
+                finish_reason: crate::stream::FinishReason::Stop,
+                stop_sequence: None,
+                completion_usage: crate::stream::CompletionUsage::default(),
+            })
+            .await;
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].usage.is_none());
     }
 }
