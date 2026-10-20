@@ -77,6 +77,13 @@ impl ResponsesToolSet {
                 .flat_map(|(_, tools)| tools)
                 .filter_map(|tool| match tool {
                     ResponsesTool::Function(function) => Some(function.name.clone()),
+                    ResponsesTool::Custom { name } if name == "apply_patch" => Some(name.clone()),
+                    ResponsesTool::ToolSearch {
+                        execution: Some(ResponsesToolSearchExecution::Client),
+                        ..
+                    } if model_version.supports_mid_conversation_system() => {
+                        Some("tool_search".to_string())
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -418,3 +425,28 @@ const APPLY_PATCH_DESCRIPTION: &str = "Use the `apply_patch` tool to edit files.
    greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n\nIt is important to \
    remember:\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even \
    when creating a new file\n- File references can only be relative, NEVER ABSOLUTE.\n";
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn namespaces_do_not_collide_with_synthetic_apply_patch() {
+        let tools = serde_json::from_value(serde_json::json!([
+            {"type":"namespace","name":"apply_","tools":[{"type":"function","name":"patch"}]},
+            {"type":"custom","name":"apply_patch"}
+        ]))
+        .unwrap();
+        let options = ConversionOptions::default();
+        let set = ResponsesToolSet::from_declarations(
+            Some(tools),
+            &options,
+            ModelVersion::DeepseekV4Pro,
+            None,
+        )
+        .unwrap();
+        let (tools, _) = set.convert_tools(None, false, &options).unwrap();
+        let names: std::collections::HashSet<_> = tools.iter().map(|t| &t.name).collect();
+        assert_eq!(names.len(), 2);
+    }
+}
