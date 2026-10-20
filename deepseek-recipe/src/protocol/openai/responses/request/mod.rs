@@ -35,8 +35,9 @@
 //! output is placed right after that output. For V4, a namespace tool is named
 //! `{namespace}__{name}`, or `{namespace}{name}` when the namespace ends with
 //! or the name starts with an underscore, and `apply_patch` uses the V4
-//! description. The caller supplies model inference, tool execution, and HTTP
-//! transport.
+//! description. Flattened namespace names also avoid top-level names found in
+//! historical calls, including calls to tools no longer declared in the request.
+//! The caller supplies model inference, tool execution, and HTTP transport.
 //!
 //! [`WebSearchBehavior::Reject`]: crate::request::WebSearchBehavior::Reject
 //! [`ModelVersion::DeepseekV41Flash`]:
