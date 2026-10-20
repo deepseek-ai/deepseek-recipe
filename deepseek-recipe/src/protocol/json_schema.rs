@@ -21,6 +21,8 @@ pub(crate) enum JsonSchema {
     SimpleAnyOf {
         r#type: Vec<SimpleJsonSchemaType>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        r#enum: Option<Vec<serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
     #[untagged_deserialize(field = "type")]
@@ -362,5 +364,23 @@ mod tests {
                 .expect_err("the schema is rejected")
                 .contains("one of `type`, `anyOf`, `$ref` field is required")
         );
+    }
+}
+
+#[cfg(test)]
+mod contribution_regression {
+    use super::*;
+
+    #[test]
+    fn nullable_enum_constraints_survive_normalization() {
+        let input = serde_json::json!({"type":"object","properties":{"state":{"type":["string","null"],"enum":["on",null]}}});
+        let result = normalize_strict_schema(input, true, |e| e.to_string(), "root").unwrap();
+        assert_eq!(
+            result["properties"]["state"]["enum"],
+            serde_json::json!(["on", null])
+        );
+        let validator = jsonschema::options().offline().build(&result).unwrap();
+        assert!(validator.is_valid(&serde_json::json!({"state":null})));
+        assert!(!validator.is_valid(&serde_json::json!({"state":"invalid"})));
     }
 }
