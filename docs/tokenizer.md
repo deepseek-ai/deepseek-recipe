@@ -71,6 +71,11 @@ ranges is plain text, encoded without the added vocabulary. `PromptTokenizer`
 encodes the plain regions as one batch, which the `tokenizers` crate can encode
 in parallel, depending on its `TOKENIZERS_PARALLELISM` setting.
 
+`PromptTokenizer` disables padding and truncation in its private copy of the
+tokenizer, so that individual plain regions are neither padded nor shortened.
+The original tokenizer and its direct encoding behavior are unchanged. Apply
+context limits to the complete encoded prompt, as described below.
+
 A special-token spelling typed into a user message is plain text, so it cannot
 act as a control token. A caller that tokenizes `RenderedPrompt::prompt` itself
 must apply `special_ranges` the same way.

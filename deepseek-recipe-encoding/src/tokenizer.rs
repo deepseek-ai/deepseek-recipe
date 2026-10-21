@@ -36,7 +36,9 @@ pub trait TokenizerEncoder: Send + Sync {
 ///
 /// It holds a copy of the tokenizer without its added vocabulary, which
 /// encodes plain text, and the added vocabulary, which supplies special token
-/// IDs.
+/// IDs. Padding and truncation are disabled in the copy: plain regions are
+/// fragments of one prompt, not independent sequences. The caller's tokenizer
+/// is unchanged.
 #[derive(Clone)]
 pub struct PromptTokenizer {
     plain_tokenizer: Tokenizer,
@@ -54,6 +56,10 @@ impl PromptTokenizer {
             .collect();
         let mut plain_tokenizer = tokenizer.clone();
         plain_tokenizer.with_added_vocabulary(AddedVocabulary::new());
+        plain_tokenizer.with_padding(None);
+        plain_tokenizer
+            .with_truncation(None)
+            .expect("disabling truncation is valid");
         Self {
             plain_tokenizer,
             added_vocabulary,
@@ -74,7 +80,7 @@ impl TokenizerEncoder for PromptTokenizer {
     /// token ID of its spelling. The batch runs in parallel unless the
     /// `TOKENIZERS_PARALLELISM` environment variable disables it. The
     /// tokenizer adds no tokens, such as a BOS token, beyond those that the
-    /// text encodes to, provided that it has no padding configured.
+    /// text encodes to, and does not truncate the plain regions.
     ///
     /// # Errors
     ///
@@ -120,5 +126,126 @@ impl TokenizerEncoder for PromptTokenizer {
 impl<T: TokenizerEncoder + ?Sized> TokenizerEncoder for Arc<T> {
     fn encode_ids(&self, text: &str, special_ranges: &[Range<usize>]) -> Result<Vec<u32>, String> {
         (**self).encode_ids(text, special_ranges)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokenizers::{PaddingParams, PaddingStrategy, TruncationParams};
+
+    use super::*;
+
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../static/tokenizers/v41/tokenizer.json"
+        ))
+        .expect("the bundled V4.1 tokenizer loads")
+    }
+
+    fn assert_prompt_regions(padding: Option<PaddingStrategy>, truncation: bool) {
+        let original = tokenizer();
+        let plain = "one two three four five";
+        let bos = "<｜begin▁of▁sentence｜>";
+        let eos = "<｜end▁of▁sentence｜>";
+        let text = format!("{bos}{plain}{eos}");
+        let ranges = [0..bos.len(), bos.len() + plain.len()..text.len()];
+        let mut expected = vec![original.token_to_id(bos).unwrap()];
+        let plain_ids = original.encode(plain, false).unwrap().get_ids().to_vec();
+        assert!(plain_ids.len() > 2, "the fixture must exercise truncation");
+        expected.extend_from_slice(&plain_ids);
+        expected.push(original.token_to_id(eos).unwrap());
+
+        let mut configured = original.clone();
+        configured.with_padding(padding.clone().map(|strategy| PaddingParams {
+            strategy,
+            pad_id: 0,
+            ..PaddingParams::default()
+        }));
+        configured
+            .with_truncation(truncation.then_some(TruncationParams {
+                max_length: 2,
+                ..TruncationParams::default()
+            }))
+            .unwrap();
+        let before = configured.to_string(false).unwrap();
+        let encoder = PromptTokenizer::new(&configured);
+        assert_eq!(
+            encoder.encode_ids(&text, &ranges).unwrap(),
+            expected,
+            "padding={padding:?}, truncation={truncation}"
+        );
+        assert_eq!(configured.to_string(false).unwrap(), before);
+        assert_eq!(encoder.encode_ids(plain, &[]).unwrap(), plain_ids);
+        assert!(encoder.encode_ids("", &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prompt_regions_are_not_padded() {
+        assert_prompt_regions(Some(PaddingStrategy::Fixed(32)), false);
+        assert_prompt_regions(Some(PaddingStrategy::BatchLongest), false);
+    }
+
+    #[test]
+    fn prompt_regions_are_not_truncated() {
+        assert_prompt_regions(None, true);
+    }
+
+    #[test]
+    fn configured_tokenizers_preserve_both_model_prompts() {
+        use deepseek_recipe_core::conversation::Conversation;
+        use deepseek_recipe_core::messages::InputMessage;
+        use deepseek_recipe_core::prompt::Prompt;
+
+        use crate::PromptEncoding;
+        use crate::v4::{dsv4::DeepseekV4Encoding, dsv41::DeepseekV41Encoding};
+
+        let original = tokenizer();
+        let mut configured = original.clone();
+        configured.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
+            pad_to_multiple_of: Some(8),
+            ..PaddingParams::default()
+        }));
+        configured
+            .with_truncation(Some(TruncationParams {
+                max_length: 2,
+                ..TruncationParams::default()
+            }))
+            .unwrap();
+        // Saved tokenizer.json files retain these settings, including when
+        // loaded through the Python bindings.
+        let configured =
+            Tokenizer::from_bytes(configured.to_string(false).unwrap().as_bytes()).unwrap();
+        let conversation = Conversation {
+            messages: vec![InputMessage::User {
+                content: Prompt::plain("Please preserve every word in this message."),
+                image_sources: Vec::new(),
+            }],
+            thinking_mode: false,
+            ..Conversation::default()
+        };
+        let reference = PromptTokenizer::new(&original);
+        let actual = PromptTokenizer::new(&configured);
+        assert_eq!(
+            DeepseekV4Encoding::new()
+                .with_tokenizer(actual.clone())
+                .encode(&conversation)
+                .unwrap(),
+            DeepseekV4Encoding::new()
+                .with_tokenizer(reference.clone())
+                .encode(&conversation)
+                .unwrap()
+        );
+        assert_eq!(
+            DeepseekV41Encoding::new()
+                .with_tokenizer(actual)
+                .encode(&conversation)
+                .unwrap(),
+            DeepseekV41Encoding::new()
+                .with_tokenizer(reference)
+                .encode(&conversation)
+                .unwrap()
+        );
     }
 }

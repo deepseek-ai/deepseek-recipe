@@ -149,6 +149,37 @@ def test_encoding_with_tokenizer():
     assert prompt_ids == tokenizer.encode(encoding.render_conversation(converted.conversation).prompt)
 
 
+
+@pytest.mark.parametrize("encoding_class", [DeepseekV4Encoding, DeepseekV41Encoding])
+def test_prompt_encoding_preserves_input_with_configured_tokenizer(encoding_class):
+    text = "Please preserve every word in this message."
+    conversation = Conversation(messages=[UserMessage(text)], thinking_mode=False)
+    reference = Tokenizer.from_file(str(TOKENIZER_PATH))
+    config = json.loads(TOKENIZER_PATH.read_text())
+    config["padding"] = {
+        "strategy": "BatchLongest",
+        "direction": "Right",
+        "pad_to_multiple_of": 8,
+        "pad_id": 0,
+        "pad_type_id": 0,
+        "pad_token": "[PAD]",
+    }
+    config["truncation"] = {
+        "direction": "Right",
+        "max_length": 2,
+        "strategy": "LongestFirst",
+        "stride": 0,
+    }
+    configured = Tokenizer.from_str(json.dumps(config))
+    direct_ids = configured.encode(text)
+    assert len(direct_ids) == 8
+    assert encoding_class().with_tokenizer(configured).encode(conversation) == (
+        encoding_class().with_tokenizer(reference).encode(conversation)
+    )
+    # Preparing the prompt encoder must not change direct tokenizer usage.
+    assert configured.encode(text) == direct_ids
+
+
 def test_prompt_encoding_differs_from_tokenizer_on_special_token_spellings():
     tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
     encoding = DeepseekV41Encoding().with_tokenizer(tokenizer)

@@ -45,6 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 `render_conversation` 只执行渲染这一步：它返回 prompt 文本、其中显式 special token 的字节区间（`special_ranges`）以及图片来源。渲染把模板的控制 token、消息图片来源对应的占位符，以及 assistant 内容和 reasoning 内容中的 grounding token 作为显式 special token 插入。分词时，每个 special 区间编码为其拼写对应的 token ID，区间之间的文本是 plain text，不使用 added vocabulary 编码；`PromptTokenizer` 把各 plain 区域作为一个 batch 编码；`tokenizers` crate 可以并行编码该 batch，取决于其 `TOKENIZERS_PARALLELISM` 设置。
 
+`PromptTokenizer` 会在私有 tokenizer 副本中禁用 padding 和 truncation，避免对单个 plain 区域填充或截断。原 tokenizer 及其直接编码行为保持不变。上下文限制应在完整 prompt 编码后处理，见下文。
+
 因此，用户消息里写出的 special token 拼写是 plain text，不会成为控制 token。调用方自行对 `RenderedPrompt::prompt` 分词时必须同样处理 `special_ranges`。
 
 编码之后，调用方用 `ConversationRequest::resolve_max_tokens(prompt_tokens, context_limit)` 解析要下发的 `max_tokens`。`prompt_tokens` 是编码得到的 token ID 数加上图片超出占位符的 token 数（`MultiModalData::image_token_adjustment`），`context_limit` 是模型上下文可容纳的 token 数。请求指定的 `max_tokens` 保持不变；未指定时，非思考模式取 8192，思考模式且 reasoning effort 为 `max` 时取 131072，其余思考模式取 65536，并降到 prompt 之后剩余的上下文以内。prompt 与请求的 `max_tokens` 之和超过 `context_limit` 时，该方法返回 `ConversionError`。
