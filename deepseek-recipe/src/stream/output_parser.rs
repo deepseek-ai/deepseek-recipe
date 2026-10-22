@@ -51,6 +51,7 @@ pub struct ParsingOptions {
     /// tokens.
     pub thinking_initial_stage: Option<ThinkingInitialStage>,
     /// Match stop sequences in answer content and detected JSON output.
+    /// Matching uses the decoded spelling of both plain and special tokens.
     /// Reasoning content, tool-call markup, and the text around JSON output are
     /// excluded. The parser discards empty sequences during construction.
     pub stop_sequences: Vec<String>,
@@ -611,7 +612,14 @@ impl State {
             self.buffered_len += 1;
             let mut matched_branch = None;
             for branch in self.match_branches.0.iter_mut() {
-                if branch.state.feed(byte, kind) {
+                // Stop strings constrain decoded text regardless of token kind;
+                // structural markers still require their original token kinds.
+                let match_kind = if branch.action_on_matched == OutputAction::StopSequence {
+                    ChunkKind::Text
+                } else {
+                    kind
+                };
+                if branch.state.feed(byte, match_kind) {
                     matched_branch = Some((
                         branch.state.matching_len(),
                         branch.next_stage,

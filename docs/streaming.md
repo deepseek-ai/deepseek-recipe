@@ -8,6 +8,12 @@ Completions chunks. The application supplies the backend and HTTP transport.
 In thinking mode, the processor counts `reasoning_tokens` for usage only when a
 tokenizer is attached; see [Use with tokenizer](tokenizer.md#decoding).
 
+Stop strings match decoded answer content and detected JSON output for both
+text and token-ID input, including special-token spellings. They do not match
+reasoning content or tool-call markup and arguments. Recognition of structural
+markers such as the thinking terminator and DSML still respects token identity
+for token-ID input.
+
 ## Rust
 
 Add the dependencies to your application:

@@ -1142,4 +1142,131 @@ mod tests {
         assert_eq!(content(&output), "");
         assert_eq!(finish_chunk(&output).2.completion_tokens, 2);
     }
+
+    #[tokio::test]
+    async fn stop_sequences_match_special_token_output() {
+        let tokenizer = tokenizer();
+        let marker = "<｜ref｜>";
+        let options = || ParsingOptions {
+            stop_sequences: vec![marker.to_owned()],
+            ..ParsingOptions::default()
+        };
+        let transcript = format!("answer{marker}not emitted");
+        let text_output = parse_texts(&[&transcript], options()).await;
+        assert_eq!(content(&text_output), "answer");
+        let ids = encode(&tokenizer, &transcript);
+        assert!(ids.contains(&special_token_id(&tokenizer, marker)));
+        let token_output = parse(
+            processor(options()).with_tokenizer(tokenizer),
+            vec![
+                InferenceChunk::Tokens {
+                    token_ids: ids,
+                    logprobs: None,
+                },
+                finish(InferenceFinishReason::Stop),
+            ],
+        )
+        .await;
+        assert_eq!(content(&token_output), "answer");
+        assert_eq!(finish_chunk(&token_output).0, FinishReason::StopSequence);
+        assert_eq!(finish_chunk(&token_output).1, Some(marker));
+    }
+
+    #[tokio::test]
+    async fn stop_sequences_span_plain_and_special_tokens_at_every_token_split() {
+        let tokenizer = tokenizer();
+        let stop = "ab<｜ref｜>cd";
+        let ids = encode(&tokenizer, "aab<｜ref｜>cdd");
+        for split in 0..=ids.len() {
+            let options = ParsingOptions {
+                stop_sequences: vec![stop.to_owned()],
+                ..ParsingOptions::default()
+            };
+            let output = parse(
+                processor(options).with_tokenizer(tokenizer.clone()),
+                vec![
+                    InferenceChunk::Tokens {
+                        token_ids: ids[..split].to_vec(),
+                        logprobs: None,
+                    },
+                    InferenceChunk::Tokens {
+                        token_ids: ids[split..].to_vec(),
+                        logprobs: None,
+                    },
+                    finish(InferenceFinishReason::Stop),
+                ],
+            )
+            .await;
+            assert_eq!(content(&output), "a", "split {split}");
+            assert_eq!(finish_chunk(&output).0, FinishReason::StopSequence);
+            assert_eq!(finish_chunk(&output).1, Some(stop));
+        }
+    }
+
+    #[tokio::test]
+    async fn special_token_stops_stay_excluded_from_reasoning_and_tool_arguments() {
+        let tokenizer = tokenizer();
+        let marker = "<｜ref｜>";
+        let options = || ParsingOptions {
+            stop_sequences: vec![marker.to_owned()],
+            ..reasoning_options()
+        };
+        let transcript = format!("hidden{marker}value</think>answer{marker}ignored");
+        let output = parse(
+            processor(options()).with_tokenizer(tokenizer.clone()),
+            vec![
+                InferenceChunk::Tokens {
+                    token_ids: encode(&tokenizer, &transcript),
+                    logprobs: None,
+                },
+                finish(InferenceFinishReason::Stop),
+            ],
+        )
+        .await;
+        assert_eq!(reasoning(&output), format!("hidden{marker}value"));
+        assert_eq!(content(&output), "answer");
+        assert_eq!(finish_chunk(&output).0, FinishReason::StopSequence);
+
+        let tool_calls = format!(
+            r#"<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="x" string="true">a{marker}b</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"#
+        );
+        let output = parse(
+            processor(options()).with_tokenizer(tokenizer.clone()),
+            vec![
+                InferenceChunk::Tokens {
+                    token_ids: encode(&tokenizer, &tool_calls),
+                    logprobs: None,
+                },
+                finish(InferenceFinishReason::Stop),
+            ],
+        )
+        .await;
+        assert_tool_calls(&output, &[("f", r#"{"x": "a<｜ref｜>b"}"#)]);
+        assert_eq!(finish_chunk(&output).0, FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn special_token_stops_also_match_in_json_output() {
+        let tokenizer = tokenizer();
+        let marker = "<｜ref｜>";
+        let options = ParsingOptions {
+            stop_sequences: vec![marker.to_owned()],
+            parse_json_output: true,
+            ..ParsingOptions::default()
+        };
+        let output = parse(
+            processor(options).with_tokenizer(tokenizer.clone()),
+            vec![
+                InferenceChunk::Tokens {
+                    token_ids: encode(&tokenizer, r#"{"x":"a<｜ref｜>b"}"#),
+                    logprobs: None,
+                },
+                finish(InferenceFinishReason::Stop),
+            ],
+        )
+        .await;
+        assert_eq!(content(&output), r#"{"x":"a"#);
+        assert_eq!(finish_chunk(&output).0, FinishReason::StopSequence);
+        assert_eq!(finish_chunk(&output).1, Some(marker));
+    }
 }

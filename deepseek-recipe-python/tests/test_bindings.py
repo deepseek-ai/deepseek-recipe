@@ -1016,3 +1016,41 @@ def test_sse_framing_of_the_three_responses():
         assert json.loads(response.to_json())["id"] == "sse"
         with pytest.raises(RuntimeError, match="consumed"):
             response_type.sse_event_name(outputs[0])
+
+
+@pytest.mark.parametrize(
+    "request_type,response_type,stop_key",
+    [
+        (ChatCompletionRequest, ChatCompletionResponse, "stop"),
+        (MessagesRequest, MessagesResponse, "stop_sequences"),
+    ],
+)
+def test_stop_strings_match_special_tokens(request_type, response_type, stop_key):
+    marker = "<｜ref｜>"
+    converted = request_type({
+        **REQUEST, "thinking": {"type": "disabled"}, stop_key: [marker],
+    }).convert(ConversionOptions())
+    tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
+    transcript = f"answer{marker}not emitted"
+    for tokens in (False, True):
+        generator = request_type.chunk_generator(converted, "stop-test", "m")
+        chunk = (
+            InferenceChunk.tokens(tokenizer.encode(transcript)) if tokens
+            else InferenceChunk.text(transcript)
+        )
+        outputs = run_processor(
+            generator, converted.parsing_options,
+            [InferenceChunk.ready(), chunk],
+            tokenizer if tokens else None,
+        )
+        response = response_type("stop-test", "m", 0, 0, 0)
+        for output in outputs:
+            response.accumulate(output)
+        body = json.loads(response.to_json())
+        if request_type is ChatCompletionRequest:
+            assert body["choices"][0]["message"]["content"] == "answer"
+            assert body["choices"][0]["finish_reason"] == "stop"
+        else:
+            assert body["content"] == [{"type": "text", "text": "answer"}]
+            assert body["stop_reason"] == "stop_sequence"
+            assert body["stop_sequence"] == marker

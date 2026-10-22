@@ -4,6 +4,8 @@
 
 `StreamProcessor` 把后端输出转换为 Messages、Chat Completions 或 Responses 事件。以下示例使用 mock 推理并打印 Chat Completions chunk。后端与 HTTP 传输由应用提供。思考模式下，只有为 processor 附加 tokenizer 后，它才会统计 usage 中的 `reasoning_tokens`，见[使用 tokenizer](tokenizer.zh.md#解码)。
 
+stop 字符串会匹配解码后的正文和检测到的 JSON 输出，包括 special token 的拼写；文本输入和 token-ID 输入遵循同一规则。它不匹配思考内容、工具调用标记或参数。对于 token-ID 输入，思考结束标记和 DSML 等结构标记的识别仍依据 token 身份。
+
 ## Rust
 
 为你的应用添加依赖：
