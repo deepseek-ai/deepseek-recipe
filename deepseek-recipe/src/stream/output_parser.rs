@@ -161,11 +161,11 @@ pub(super) enum InvalidTokenKind {
 /// two distinct actions to produce both of its quotes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ArgumentsLabel {
-    /// `{` before the first argument.
+    /// `{"` before the first argument name.
     ObjectOpen,
-    /// `, ` before each later argument.
+    /// `, "` before each later argument name.
     ArgumentSeparator,
-    /// `: ` between an argument name and its value.
+    /// `": ` between an argument name and its value.
     KeyValueSeparator,
     /// `"` before a string value.
     StringOpen,
@@ -176,9 +176,9 @@ pub(super) enum ArgumentsLabel {
 impl ArgumentsLabel {
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            Self::ObjectOpen => "{",
-            Self::ArgumentSeparator => ", ",
-            Self::KeyValueSeparator => ": ",
+            Self::ObjectOpen => "{\"",
+            Self::ArgumentSeparator => ", \"",
+            Self::KeyValueSeparator => "\": ",
             Self::StringOpen | Self::StringClose => "\"",
         }
     }
@@ -247,7 +247,7 @@ enum Stage {
     /// Inside an `invoke` tag, before a `parameter` tag or the closing tag.
     /// `is_first_argument` holds until the first argument is written.
     ToolCallArguments { is_first_argument: bool },
-    /// The quoted argument name of a `parameter` tag.
+    /// The argument name of a `parameter` tag, up to its closing quote.
     ToolCallArgumentName,
     /// The `string="true|false">` attribute of a `parameter` tag.
     ToolCallArgumentStringAttribute,
@@ -504,7 +504,7 @@ impl State {
             }
             Stage::ToolCallArguments { is_first_argument } => {
                 match_branches.add_literal_branch(
-                    "parameter name=",
+                    "parameter name=\"",
                     Stage::ToolCallArgumentName,
                     if is_first_argument {
                         ActionOnMatched::LabelToolCallArguments(ArgumentsLabel::ObjectOpen)
@@ -525,7 +525,7 @@ impl State {
             }
             Stage::ToolCallArgumentName => {
                 match_branches.add_literal_branch(
-                    " ",
+                    "\"",
                     Stage::ToolCallArgumentStringAttribute,
                     ActionOnMatched::LabelToolCallArguments(ArgumentsLabel::KeyValueSeparator),
                 );

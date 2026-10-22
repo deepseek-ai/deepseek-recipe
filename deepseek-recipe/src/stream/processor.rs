@@ -749,6 +749,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn argument_names_keep_their_spaces() {
+        // Names with and without spaces, as first and later arguments, with
+        // string and raw values; an empty name ends the second call.
+        let block = r#"<｜DSML｜tool_calls>
+<｜DSML｜invoke name="book_trip">
+<｜DSML｜parameter name="start date" string="true">2026-10-22</｜DSML｜parameter>
+<｜DSML｜parameter name="city" string="true">Tokyo</｜DSML｜parameter>
+<｜DSML｜parameter name="party size" string="false">2</｜DSML｜parameter>
+<｜DSML｜parameter name="nights" string="false">3</｜DSML｜parameter>
+</｜DSML｜invoke>
+<｜DSML｜invoke name="book_trip">
+<｜DSML｜parameter name="room count" string="false">1</｜DSML｜parameter>
+<｜DSML｜parameter name="guest name" string="true">Ada Lovelace</｜DSML｜parameter>
+<｜DSML｜parameter name="" string="true">empty</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"#;
+        let expected = [
+            (
+                "book_trip",
+                r#"{"start date": "2026-10-22", "city": "Tokyo", "party size": 2, "nights": 3}"#,
+            ),
+            (
+                "book_trip",
+                r#"{"room count": 1, "guest name": "Ada Lovelace", "": "empty"}"#,
+            ),
+        ];
+        let output = format!("{PREAMBLE}\n\n{block}");
+        for chunks in [
+            parse_characters(&output, ParsingOptions::default()).await,
+            parse_texts(&[&output], ParsingOptions::default()).await,
+        ] {
+            assert_eq!(content(&chunks), PREAMBLE);
+            assert_tool_calls(&chunks, &expected);
+            assert_eq!(finish_chunk(&chunks).0, FinishReason::ToolCalls);
+        }
+    }
+
+    #[tokio::test]
     async fn json_text_in_a_string_value_is_escaped() {
         let output = format!("{PREAMBLE}\n\n{TOOL_CALLS}");
         let chunks = parse_characters(&output, ParsingOptions::default()).await;
