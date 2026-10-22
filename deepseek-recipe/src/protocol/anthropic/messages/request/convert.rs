@@ -36,6 +36,7 @@ use super::schema::{
     MessagesMessage, MessagesRequest, MessagesSystemBlock, MessagesSystemContent, MessagesTool,
     MessagesToolChoice, MessagesToolReference, MessagesToolResultBlock, MessagesToolResultContent,
 };
+use super::turns::coalesce_messages;
 
 /// The tools of a request after name validation.
 struct MessagesToolSet {
@@ -415,11 +416,12 @@ fn ensure_no_pending_tool_uses(
 /// message has an empty block list; when a `tool_use`, `server_tool_use`,
 /// `thinking`, or `web_search_tool_result` block appears outside an
 /// `assistant` message, or a `tool_result` block outside a `user` message;
-/// when a `tool_use` ID repeats within one message, a `tool_result` answers no
+/// when a `tool_use` ID repeats within one turn, a `tool_result` answers no
 /// `tool_use` of the preceding message or repeats an answered ID, a text,
 /// image, or document block follows a `tool_use` block in an `assistant`
 /// message, or a `tool_use` is not answered by the `tool_result` blocks at
-/// the start of the next message; when, for a model with image input, an
+/// the start of the next turn; consecutive messages with the same `user` or
+/// `assistant` role form one turn. When, for a model with image input, an
 /// image source is invalid or an `assistant` message holds an image block;
 /// or when an `assistant` message holds a `server_tool_use` or
 /// `web_search_tool_result` block under [`WebSearchBehavior::Reject`].
@@ -453,7 +455,7 @@ fn transform_messages(
         .map(|tool| (tool.name.as_str(), tool))
         .collect();
 
-    for (message_index, message) in messages.into_iter().enumerate() {
+    for (message_index, message) in coalesce_messages(messages)? {
         match message {
             MessagesMessage::User(MessagesContent::Raw(content)) => {
                 ensure_no_pending_tool_uses(message_index, &pending_tool_use_ids)?;
