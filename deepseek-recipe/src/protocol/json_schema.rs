@@ -2,6 +2,7 @@
 //!
 //! Strict schemas are deserialized into this type and normalized: every object
 //! lists all of its properties as required and forbids additional properties.
+//! Array length and uniqueness constraints are preserved during normalization.
 //! Non-strict schemas are only validated; see [`validate_schema`].
 
 use deepseek_recipe_macros::UntaggedDeserialize;
@@ -127,6 +128,12 @@ pub(crate) enum JsonSchemaType {
         items: Box<JsonSchema>,
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_items: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_items: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unique_items: Option<bool>,
     },
     #[serde(rename_all = "camelCase")]
     Null {
@@ -314,6 +321,31 @@ mod tests {
             normalized["properties"]["a"]["additionalProperties"],
             json!(false)
         );
+    }
+
+    #[test]
+    fn normalize_preserves_nested_array_constraints_and_normalizes_item_objects() {
+        let normalized = normalize(json!({
+            "type": "object",
+            "properties": {"groups": {
+                "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true,
+                "items": {
+                    "type": "array", "minItems": 0, "maxItems": 0, "uniqueItems": false,
+                    "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                },
+            }},
+        }))
+        .expect("the schema normalizes");
+        let groups = &normalized["properties"]["groups"];
+        assert_eq!(groups["minItems"], 1);
+        assert_eq!(groups["maxItems"], 2);
+        assert_eq!(groups["uniqueItems"], true);
+        let items = &groups["items"];
+        assert_eq!(items["minItems"], 0);
+        assert_eq!(items["maxItems"], 0);
+        assert_eq!(items["uniqueItems"], false);
+        assert_eq!(items["items"]["required"], json!(["name"]));
+        assert_eq!(items["items"]["additionalProperties"], false);
     }
 
     #[test]
