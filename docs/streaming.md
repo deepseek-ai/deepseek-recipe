@@ -8,6 +8,13 @@ Completions chunks. The application supplies the backend and HTTP transport.
 In thinking mode, the processor counts `reasoning_tokens` for usage only when a
 tokenizer is attached; see [Use with tokenizer](tokenizer.md#decoding).
 
+Token log probabilities follow the original bytes retained by the parser.
+Only complete tokens within an emitted source-text segment are reported; tokens
+crossing a parser segment boundary are omitted. Removed text and replacement
+spaces around JSON output carry no probabilities. If a custom tokenizer's
+vocabulary bytes do not match its decoded text, probabilities for that decoded
+piece are omitted. Completion usage still counts the processed backend tokens.
+
 ## Rust
 
 Add the dependencies to your application:

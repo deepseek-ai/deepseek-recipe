@@ -4,6 +4,8 @@
 
 `StreamProcessor` 把后端输出转换为 Messages、Chat Completions 或 Responses 事件。以下示例使用 mock 推理并打印 Chat Completions chunk。后端与 HTTP 传输由应用提供。思考模式下，只有为 processor 附加 tokenizer 后，它才会统计 usage 中的 `reasoning_tokens`，见[使用 tokenizer](tokenizer.zh.md#解码)。
 
+Token 的 log probability 按解析器保留的原始字节归属。只报告完整落在输出原文片段内的 token；跨解析片段边界的 token 不报告概率。被删除的文本和 JSON 输出周围生成的替代空格不带概率。若自定义 tokenizer 的词表字节与解码文本不一致，该解码片段不报告概率。completion usage 仍按已处理的后端 token 计数。
+
 ## Rust
 
 为你的应用添加依赖：

@@ -150,7 +150,7 @@ where
                                 .map(|decoded| OutputPiece {
                                     content: decoded.content,
                                     token_count: decoded.token_count,
-                                    logprobs: decoded.logprobs.map(Arc::from),
+                                    logprobs: decoded.logprobs,
                                     kind: if decoded.is_special_token {
                                         ChunkKind::SpecialToken
                                     } else {
@@ -237,15 +237,61 @@ where
 struct OutputPiece {
     content: String,
     token_count: usize,
-    logprobs: Option<Arc<[TokenLogprob]>>,
+    logprobs: Option<Vec<TokenLogprob>>,
     kind: ChunkKind,
 }
 
-/// Output text waiting for its parsing actions, with the log probabilities of
-/// the text it was split from.
+/// Output text waiting for its parsing actions and the remaining token probabilities.
 struct BufferedChunk {
     content: String,
-    logprobs: Option<Arc<[TokenLogprob]>>,
+    logprobs: Option<BufferedLogprobs>,
+}
+
+/// Consume each token probability once, using its original byte range.
+struct BufferedLogprobs {
+    tokens: VecDeque<TokenLogprob>,
+    /// Bytes already consumed from the front token. A split token is omitted.
+    offset: usize,
+}
+
+impl BufferedLogprobs {
+    fn new(content: &str, logprobs: Vec<TokenLogprob>) -> Option<Self> {
+        // A custom decoder can transform vocabulary bytes. Without matching
+        // bytes there is no reliable alignment; do not invent probabilities.
+        if logprobs.iter().any(|token| token.bytes.is_empty())
+            || !logprobs
+                .iter()
+                .flat_map(|token| token.bytes.iter().copied())
+                .eq(content.bytes())
+        {
+            return None;
+        }
+        Some(Self {
+            tokens: logprobs.into(),
+            offset: 0,
+        })
+    }
+
+    fn take(&mut self, mut byte_len: usize) -> Option<Arc<[TokenLogprob]>> {
+        let mut taken = Vec::new();
+        while let Some(token) = self.tokens.front() {
+            let remaining = token.bytes.len() - self.offset;
+            if remaining > byte_len {
+                self.offset += byte_len;
+                break;
+            }
+            let token = self.tokens.pop_front().expect("the front token exists");
+            if self.offset == 0 {
+                taken.push(token);
+            }
+            self.offset = 0;
+            byte_len -= remaining;
+            if byte_len == 0 {
+                break;
+            }
+        }
+        (!taken.is_empty()).then(|| taken.into())
+    }
 }
 
 /// Output text that the parser has not fully assigned yet, and the state
@@ -280,7 +326,8 @@ impl PendingOutput {
         }
     }
 
-    fn push(&mut self, content: String, logprobs: Option<Arc<[TokenLogprob]>>) {
+    fn push(&mut self, content: String, logprobs: Option<Vec<TokenLogprob>>) {
+        let logprobs = logprobs.and_then(|logprobs| BufferedLogprobs::new(&content, logprobs));
         self.chunks.push_back(BufferedChunk { content, logprobs });
     }
 
@@ -290,20 +337,24 @@ impl PendingOutput {
 
     /// Take the first `segment.byte_len` bytes of the front buffered chunk and
     /// convert them by the segment's action. `segment.byte_len` must not exceed
-    /// the length of the front chunk. Text split off from a chunk keeps the
-    /// chunk's log probabilities.
+    /// the length of the front chunk. Only complete tokens inside the taken
+    /// byte range keep their probabilities; a token crossing the split is omitted.
     fn take_piece(&mut self, segment: OutputActionSegment) -> Option<OutputChunk> {
         let BufferedChunk {
             content: mut piece,
-            logprobs,
+            mut logprobs,
         } = self.chunks.pop_front()?;
+        let piece_logprobs = logprobs
+            .as_mut()
+            .and_then(|logprobs| logprobs.take(segment.byte_len));
         if segment.byte_len < piece.len() {
             let remaining = piece.split_off(segment.byte_len);
             self.chunks.push_front(BufferedChunk {
                 content: remaining,
-                logprobs: logprobs.clone(),
+                logprobs,
             });
         }
+        let logprobs = piece_logprobs;
         let is_first_piece = self.previous_piece_action != segment.action;
         self.previous_piece_action = segment.action;
 
@@ -321,7 +372,7 @@ impl PendingOutput {
             }
             OutputAction::ToSpace => Some(OutputChunk::Content {
                 content: " ".to_string(),
-                logprobs,
+                logprobs: None,
             }),
             OutputAction::Skip | OutputAction::SkipInvalid { .. } => None,
             OutputAction::StopSequence => {

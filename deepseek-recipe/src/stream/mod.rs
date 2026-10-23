@@ -59,9 +59,11 @@ impl std::error::Error for StreamError {}
 /// `ToolCallArgumentsDelta` chunks; output truncated inside a tool call ends
 /// that sequence early.
 ///
-/// `logprobs` holds the log probabilities of the tokens of the decoded text the
-/// content comes from. Content split from one decoded text carries the log
-/// probabilities of the whole text.
+/// `logprobs` holds original token probabilities only for complete tokens
+/// inside the emitted source-text segment. Tokens crossing a parser segment
+/// boundary are omitted, as are probabilities for replaced text (such as JSON
+/// padding). If vocabulary bytes do not match decoded text, probabilities for
+/// that decoded piece are omitted. No token probability is duplicated.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputChunk {
     /// Output begins.
