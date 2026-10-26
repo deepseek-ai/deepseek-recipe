@@ -18,6 +18,8 @@ caller must provide model inference, tool execution, and HTTP transport.
 [Streaming response](docs/streaming.md) ·
 [Use with tokenizer](docs/tokenizer.md) · [License](#license)
 
+[![Papers with Code: SOTA on AGIEval](https://paperswithcode.co/api/v1/papers/2609.19969/leaderboard-badge.svg?eval=32298&live=1)](https://paperswithcode.co/api/v1/papers/2609.19969/leaderboard-badge-link?eval=32298)
+
 ## Supported scope
 
 - **Request/response formats:** Conversion of Messages, Chat Completions, and
