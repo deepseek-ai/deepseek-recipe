@@ -18,7 +18,7 @@ deepseek-recipe 包含一套 Rust 库以及对应的 Python bindings：支持将
 - **生成参数：** 思考模式、reasoning effort、`temperature`、`top_p` 和输出 token 上限。调用方编码 prompt 之后，`ConversationRequest::resolve_max_tokens` 按上下文长度检查 prompt 与 `max_tokens`，并给未指定的 `max_tokens` 取默认值：非思考模式 8192，思考模式 65536，思考模式且 `max` effort 时 131072。
 - **输出解析：** reasoning 内容、工具调用、JSON object 输出和 stop sequence。流式处理器附加 tokenizer 后，usage 会给出 `reasoning_tokens`：processor 用该 tokenizer 编码 reasoning 内容来计数。
 - **结构化输出：** Chat Completions 的 `response_format`（`json_schema` 与 `regex` 类型）和 Responses 的 `text.format`（`json_schema` 类型）。转换会校验 JSON Schema，渲染时把它写入 prompt；正则表达式以 `ResponseFormat::Regex` 透传。转换还会选出 `InferenceOptions` 的 `OutputConstraint`：带工具且 tool choice 不为 `none` 的请求是工具调用块，否则是 response format 对应的 JSON、JSON Schema 或正则。是否由后端以约束解码执行，由调用方决定。
-- **图片：** 支持以 base64 或外部 URL 传入，由图片组件基于 OpenCV 完成 DeepSeek V4.1 的预处理。DeepSeek V4 不接受图片，转换把 V4 请求中的每张图片替换为文本 `[Unsupported Image]`。图片组件的 `ReqwestImageFetcher` 默认不限制连接的地址，因此如果服务会拉取不受信任请求中的 URL，应为它安装 `DestinationFilter`。
+- **图片：** 支持以 base64 或外部 URL 传入，由图片组件基于 OpenCV 完成 DeepSeek V4.1 的预处理。JPEG 的 EXIF 旋转和镜像方向会在缩放及 WebP 编码前应用到像素。DeepSeek V4 不接受图片，转换把 V4 请求中的每张图片替换为文本 `[Unsupported Image]`。图片组件的 `ReqwestImageFetcher` 默认不限制连接的地址，因此如果服务会拉取不受信任请求中的 URL，应为它安装 `DestinationFilter`。
 - **工具定义：** 函数工具；Responses 还支持工具命名空间和 `apply_patch` 自定义工具。V4.1 支持 Messages 的工具延迟加载和 Responses 的客户端工具搜索。
 - **Log probability：** Chat Completions 的 `logprobs`、`top_logprobs` 以及 Responses 的 `top_logprobs` 会转换到 `InferenceOptions`。调用方在 `InferenceChunk::Tokens` 中提供后端的值；附加 tokenizer 后，Chat Completions 与 Responses 的 adapter 会输出这些值。本库不计算概率。
 

@@ -28,7 +28,8 @@ const WEBP_QUALITY: i32 = 90;
 ///
 /// Preprocessing detects the media type from the file header, rejects an image
 /// whose width or height exceeds [`PreprocessOptions::max_dimension_px`],
-/// decodes the image, applies the low-detail limit, fits the image into the
+/// decodes the image (applying JPEG EXIF orientation), applies the low-detail
+/// limit, fits the image into the
 /// V4.1 token budget, and encodes it as WebP at quality 90.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenCvImagePreprocessor;
@@ -133,7 +134,15 @@ fn decode_image_mat(data: &[u8], media_type: ImageMediaType) -> Result<Mat, Imag
     let mat = if media_type == ImageMediaType::Gif {
         gif_to_mat(data)?
     } else {
-        imgcodecs::imdecode(&Vector::from_slice(data), imgcodecs::IMREAD_UNCHANGED)
+        // JPEG has no alpha channel to preserve. Unlike IMREAD_UNCHANGED,
+        // IMREAD_COLOR applies EXIF orientation before metadata is discarded
+        // by the WebP re-encode. Keep the unchanged path for alpha/16-bit PNGs.
+        let flags = if media_type == ImageMediaType::Jpeg {
+            imgcodecs::IMREAD_COLOR
+        } else {
+            imgcodecs::IMREAD_UNCHANGED
+        };
+        imgcodecs::imdecode(&Vector::from_slice(data), flags)
             .map_err(|err| ImageError::decode(err.to_string()))?
     };
 
@@ -473,5 +482,121 @@ fn round_half_even(value: f64) -> i32 {
         floor as i32
     } else {
         (floor + 1.0) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use image::metadata::Orientation;
+    use image::{DynamicImage, ImageEncoder, RgbImage};
+
+    use super::*;
+    use crate::ImageLimits;
+    use deepseek_recipe_core::multimodal::ImageDetail;
+
+    fn jpeg(orientation: Option<u8>) -> Vec<u8> {
+        let pixels = RgbImage::from_fn(32, 48, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 5) as u8, ((x + y) * 3) as u8])
+        });
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+        if let Some(orientation) = orientation {
+            // Little-endian TIFF header with one SHORT Orientation entry.
+            let mut exif = b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+            encoder.set_exif_metadata(exif).unwrap();
+        }
+        encoder
+            .encode_image(&DynamicImage::ImageRgb8(pixels))
+            .unwrap();
+        bytes
+    }
+
+    fn reference(orientation: u8) -> DynamicImage {
+        let raw = imgcodecs::imdecode(
+            &Vector::from_slice(&jpeg(None)),
+            imgcodecs::IMREAD_UNCHANGED,
+        )
+        .unwrap();
+        // Channel labels do not affect the pixel permutation. Keep BGR bytes
+        // so this independent image-crate transform can be compared exactly.
+        let pixels = RgbImage::from_raw(
+            raw.cols() as u32,
+            raw.rows() as u32,
+            raw.data_bytes().unwrap().to_vec(),
+        )
+        .unwrap();
+        let mut image = DynamicImage::ImageRgb8(pixels);
+        image.apply_orientation(Orientation::from_exif(orientation).unwrap());
+        image
+    }
+
+    #[test]
+    fn jpeg_orientation_matches_an_independent_pixel_transform() {
+        for orientation in 1..=8 {
+            let actual = decode_image_mat(&jpeg(Some(orientation)), ImageMediaType::Jpeg).unwrap();
+            let expected = reference(orientation);
+            assert_eq!(
+                (actual.cols() as u32, actual.rows() as u32),
+                (expected.width(), expected.height()),
+                "orientation {orientation}"
+            );
+            assert!(
+                actual.data_bytes().unwrap() == expected.as_bytes(),
+                "pixel mismatch for orientation {orientation}"
+            );
+        }
+        let untagged = decode_image_mat(&jpeg(None), ImageMediaType::Jpeg).unwrap();
+        assert_eq!(untagged.data_bytes().unwrap(), reference(1).as_bytes());
+        for orientation in [0, 9] {
+            let invalid = decode_image_mat(&jpeg(Some(orientation)), ImageMediaType::Jpeg).unwrap();
+            assert_eq!(
+                invalid.data_bytes().unwrap(),
+                untagged.data_bytes().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oriented_jpeg_preprocessing_matches_preoriented_pixels() {
+        for orientation in [2, 3, 4, 5, 6, 7, 8] {
+            let expected = reference(orientation);
+            let mut mat = Mat::new_rows_cols_with_default(
+                expected.height() as i32,
+                expected.width() as i32,
+                opencv::core::CV_8UC3,
+                Scalar::all(0.0),
+            )
+            .unwrap();
+            mat.data_bytes_mut()
+                .unwrap()
+                .copy_from_slice(expected.as_bytes());
+            let mut png = Vector::new();
+            assert!(imgcodecs::imencode(".png", &mat, &mut png, &Vector::new()).unwrap());
+            for detail in [ImageDetail::High, ImageDetail::Low] {
+                let options = ImageLimits::default().preprocess_options(detail, 1);
+                let actual = OpenCvImagePreprocessor
+                    .preprocess(jpeg(Some(orientation)), options)
+                    .await
+                    .unwrap();
+                let expected = OpenCvImagePreprocessor
+                    .preprocess(png.to_vec(), options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (actual.width, actual.height),
+                    (expected.width, expected.height),
+                    "orientation {orientation}, {detail:?}"
+                );
+                assert!(
+                    actual.data == expected.data,
+                    "WebP mismatch for orientation {orientation}, {detail:?}"
+                );
+                assert!(
+                    ImageTokenSpec::v41()
+                        .is_image_valid(actual.width as usize, actual.height as usize)
+                );
+            }
+        }
     }
 }

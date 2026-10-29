@@ -45,7 +45,8 @@ caller must provide model inference, tool execution, and HTTP transport.
   Schema, or regex of its response format. The caller decides whether its
   backend enforces it by constrained decoding.
 - **Images:** Provided as base64 or external URLs, and preprocessed for
-  DeepSeek V4.1 with OpenCV by the image component. DeepSeek V4 does not
+  DeepSeek V4.1 with OpenCV by the image component. JPEG EXIF rotation and
+  mirroring are applied before resizing and WebP encoding. DeepSeek V4 does not
   accept images; conversion replaces each image in a V4 request with the text
   `[Unsupported Image]`. The component's `ReqwestImageFetcher`
   connects to any address by default, so a service that fetches URLs from
