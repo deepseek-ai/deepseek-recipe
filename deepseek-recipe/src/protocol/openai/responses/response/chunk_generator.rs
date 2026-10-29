@@ -158,6 +158,11 @@ impl ResponsesChunkGenerator {
             self.append_custom_input(output_index, parser.finish(), events);
         }
         let item = &mut self.response.output[output_index];
+        if let ResponsesOutputItem::Message { phase, .. } = item
+            && phase.is_none()
+        {
+            *phase = Some(ResponsesPhase::FinalAnswer);
+        }
         match item {
             ResponsesOutputItem::Message {
                 status: item_status,
@@ -289,7 +294,7 @@ impl ResponsesChunkGenerator {
                     id: format!("msg_{}_{output_index}", self.response.id),
                     status: ResponsesStatus::InProgress,
                     role: ResponsesRole::Assistant,
-                    phase: ResponsesPhase::FinalAnswer,
+                    phase: None,
                     content: vec![ResponsesContentPart::OutputText {
                         annotations: Vec::new(),
                         logprobs: Vec::new(),
@@ -409,7 +414,7 @@ impl ChunkGenerator for ResponsesChunkGenerator {
                     && let ResponsesOutputItem::Message { phase, .. } =
                         &mut self.response.output[output_index]
                 {
-                    *phase = ResponsesPhase::Commentary;
+                    *phase = Some(ResponsesPhase::Commentary);
                 }
                 self.close_item(ResponsesStatus::Completed, &mut events);
                 let output_index = self.response.output.len();
@@ -523,4 +528,84 @@ fn timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    async fn started_generator() -> ResponsesChunkGenerator {
+        let mut generator = ResponsesChunkGenerator::new(
+            "phase-repro",
+            "DeepSeek-V4.1-Flash",
+            false,
+            ResponseOptions::default(),
+        );
+        generator
+            .generate(OutputChunk::Start {
+                system_fingerprint: None,
+                prompt_usage: PromptUsage::default(),
+            })
+            .await;
+        generator
+    }
+
+    fn event_json(event: &ResponsesStreamEvent) -> Value {
+        serde_json::to_value(event).expect("response event must serialize")
+    }
+
+    #[tokio::test]
+    async fn streaming_message_phase_is_omitted_until_tool_call_classifies_it() {
+        let mut generator = started_generator().await;
+        let text_events = generator
+            .generate(OutputChunk::Content {
+                content: "I will check now.".to_string(),
+                logprobs: None,
+            })
+            .await;
+        let added = event_json(&text_events[0]);
+        assert_eq!(added["type"], "response.output_item.added");
+        assert!(added["item"].get("phase").is_none());
+
+        let tool_events = generator
+            .generate(OutputChunk::ToolCallNamed {
+                tool_name: "get_temperature".to_string(),
+            })
+            .await;
+        let done = tool_events
+            .iter()
+            .map(event_json)
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("message completion event");
+        assert_eq!(done["item"]["phase"], "commentary");
+    }
+
+    #[tokio::test]
+    async fn streaming_message_phase_is_final_answer_when_response_finishes() {
+        let mut generator = started_generator().await;
+        let text_events = generator
+            .generate(OutputChunk::Content {
+                content: "The answer is 42.".to_string(),
+                logprobs: None,
+            })
+            .await;
+        let added = event_json(&text_events[0]);
+        assert!(added["item"].get("phase").is_none());
+
+        let finish_events = generator
+            .generate(OutputChunk::Finish {
+                finish_reason: FinishReason::Stop,
+                stop_sequence: None,
+                completion_usage: Default::default(),
+            })
+            .await;
+        let done = finish_events
+            .iter()
+            .map(event_json)
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("message completion event");
+        assert_eq!(done["item"]["phase"], "final_answer");
+    }
 }

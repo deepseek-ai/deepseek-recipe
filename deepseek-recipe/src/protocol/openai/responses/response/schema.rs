@@ -175,7 +175,8 @@ pub enum ResponsesOutputItem {
         id: String,
         status: ResponsesStatus,
         role: ResponsesRole,
-        phase: ResponsesPhase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<ResponsesPhase>,
         content: Vec<ResponsesContentPart>,
     },
     Reasoning {
@@ -271,9 +272,10 @@ pub enum ResponsesRole {
     Assistant,
 }
 
-/// The phase of a message output item. A message whose answer content
-/// immediately precedes a tool call has `commentary` in the completed output
-/// item; other messages have `final_answer`.
+/// The phase of a completed message output item. A message whose answer
+/// content immediately precedes a tool call has `commentary`; other messages
+/// have `final_answer`. In-progress messages omit the phase until the next
+/// output item or response completion determines it.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesPhase {
