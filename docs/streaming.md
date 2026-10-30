@@ -8,6 +8,33 @@ Completions chunks. The application supplies the backend and HTTP transport.
 In thinking mode, the processor counts `reasoning_tokens` for usage only when a
 tokenizer is attached; see [Use with tokenizer](tokenizer.md#decoding).
 
+## Measuring time to first token
+
+`InferenceChunk::Ready` (`InferenceChunk.ready(...)` in Python) produces a **start chunk**
+immediately: in Chat Completions format it carries `delta: {"role": "assistant"}` with an
+**empty `content`**. The first real token arrives in a later chunk.
+
+So if you measure time to first token (TTFT) from the first SSE frame, you are measuring
+**request acceptance + tokenization**, not the first token: prompt processing has not started
+yet, and that time later shows up as inflated inter-token latency.
+
+Measure TTFT on the first chunk whose `delta.content` is non-empty (and, in thinking mode, also
+consider `delta.reasoning_content`), e.g.:
+
+```python
+first_frame_ts = None
+first_token_ts = None
+for chunk in stream:
+    now = time.perf_counter()
+    first_frame_ts = first_frame_ts or now
+    delta = chunk["choices"][0].get("delta", {})
+    if delta.get("content") or delta.get("reasoning_content"):
+        first_token_ts = first_token_ts or now
+```
+
+On a 32K-token prompt the two definitions can differ by more than an order of magnitude
+(0.2 s vs 14.6 s in our measurement), so always state which one a reported TTFT uses.
+
 ## Rust
 
 Add the dependencies to your application:
