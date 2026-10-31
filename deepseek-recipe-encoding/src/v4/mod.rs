@@ -365,6 +365,74 @@ mod tests {
     }
 
     #[test]
+    fn v41_keeps_current_turn_reasoning_without_tool_definitions() {
+        let call = InputMessage::Assistant {
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            content: "checking".to_string(),
+            reasoning_content: Some("current reasoning".to_string()),
+            prefix: false,
+        };
+        let result = InputMessage::Tool {
+            content: Prompt::plain("observed"),
+            image_sources: Vec::new(),
+            tool_call_id: Some("call_1".to_string()),
+        };
+        let mut conversation = Conversation {
+            messages: vec![
+                user("q1"),
+                assistant("a1", "old reasoning"),
+                user("q2"),
+                call,
+                result,
+            ],
+            ..Conversation::default()
+        };
+        for disabled_tool_choice in [false, true] {
+            if disabled_tool_choice {
+                conversation.tools = vec![tool()];
+                conversation.tool_choice = ToolChoice::None;
+            }
+            let prompt = render(&conversation);
+            // Golden prompt from DeepSeek-V4.1-Flash-1017 encoding.py.
+            assert_eq!(
+                prompt,
+                concat!(
+                    "<｜begin▁of▁sentence｜><｜System｜>",
+                    "Reasoning Effort: 75 (range 1-100, the higher the value, ",
+                    "the more thorough the reasoning)\n\n",
+                    "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>",
+                    "<｜User｜>q2<｜Assistant｜><think>current reasoning</think>checking\n\n",
+                    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n\n",
+                    "</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+                    "<｜User｜><tool_result>observed</tool_result><｜Assistant｜><think>",
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn v41_drops_reasoning_only_before_the_latest_turn() {
+        for boundary in [user("q2"), system("new instructions")] {
+            let conversation = Conversation {
+                messages: vec![
+                    user("q1"),
+                    assistant("a1", "old reasoning"),
+                    boundary,
+                    assistant("a2", "current reasoning"),
+                ],
+                ..Conversation::default()
+            };
+            let prompt = render(&conversation);
+            assert!(!prompt.contains("old reasoning"));
+            assert!(prompt.contains("<｜Assistant｜><think>current reasoning</think>a2"));
+        }
+    }
+
+    #[test]
     fn consecutive_latest_reminders_keep_the_first() {
         let conversation = Conversation {
             messages: vec![
