@@ -282,11 +282,18 @@ impl PromptEncoding for DeepseekV41Encoding {
                 );
             }
         }
-        // Earlier reasoning content is rendered only with the tool prompt.
-        let drop_thinking = !renders_tool_prompt;
+        // Tool results continue the current turn; only an actual user message
+        // or a mid-conversation system message starts a new one. Without tool
+        // definitions, drop reasoning only from turns before that boundary.
+        let last_user_index = messages.iter().enumerate().rposition(|(index, message)| {
+            matches!(message, InputMessage::User { .. })
+                || (index > 0 && matches!(message, InputMessage::System { .. }))
+        });
 
         let mut prompt = prompt!("{}", self.components.special(SpecialToken::Bos));
         for index in 0..messages.len() {
+            let drop_thinking = !renders_tool_prompt
+                && last_user_index.is_some_and(|last_user_index| index < last_user_index);
             prompt += self.render_message(
                 index,
                 &messages,
