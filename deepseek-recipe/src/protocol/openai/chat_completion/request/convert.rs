@@ -9,7 +9,7 @@ use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens};
 use deepseek_recipe_core::tools::{ToolChoice, ToolDefinition};
 
 use crate::protocol::client_tools::{
-    ClientToolChoice, ClientToolDeclaration, convert_client_tools,
+    ClientToolChoice, ClientToolDeclaration, convert_client_tools, normalize_message_tools,
 };
 use crate::protocol::image::{
     UNSUPPORTED_IMAGE_PLACEHOLDER, file_data_image_source, file_id_unsupported, image_url_source,
@@ -40,10 +40,10 @@ impl ProtocolRequest for ChatCompletionRequest {
 
     /// Validate and convert Chat Completions input into a conversation request.
     ///
-    /// Checks run in the order model name, tool names, messages, reasoning
-    /// content, prefix continuation, JSON instruction, tool schemas and tool
-    /// choice, prefix combinations, stop sequences and stream options, response
-    /// format, and sampling parameters.
+    /// Checks run in the order model name, tool names, messages and the tool
+    /// names of system messages, reasoning content, prefix continuation, JSON
+    /// instruction, tool schemas and tool choice, prefix combinations, stop
+    /// sequences and stream options, response format, and sampling parameters.
     fn convert(self, options: ConversionOptions) -> Result<ConversationRequest, ConversionError> {
         let model_version = options.resolve_model_version(&self.model)?;
         let (thinking_mode, reasoning_effort) = resolve_thinking_mode(
@@ -55,19 +55,30 @@ impl ProtocolRequest for ChatCompletionRequest {
         for (index, tool) in tools.iter().enumerate() {
             validate_tool_name(&tool.function.name, &format!("tools[{index}].function"))?;
         }
-        let has_tools = !tools.is_empty();
-        let has_tool_context = has_tools
-            || self.messages.iter().any(|message| {
-                matches!(
-                    message,
-                    ChatCompletionRequestMessage::Assistant {
-                        tool_calls: Some(_),
-                        ..
-                    } | ChatCompletionRequestMessage::Tool { .. }
-                )
-            });
+        let has_tool_messages = self.messages.iter().any(|message| {
+            matches!(
+                message,
+                ChatCompletionRequestMessage::Assistant {
+                    tool_calls: Some(_),
+                    ..
+                } | ChatCompletionRequestMessage::Tool { .. }
+            )
+        });
         let image_token = options.special_tokens.token(SpecialToken::Image);
-        let mut messages = transform_messages(self.messages, image_token, model_version)?;
+        let mut message_tools = Vec::new();
+        let mut messages = transform_messages(
+            self.messages,
+            image_token,
+            model_version,
+            &mut message_tools,
+        )?;
+        let mut tools: Vec<_> = tools
+            .into_iter()
+            .map(|tool| client_tool(tool, false))
+            .collect();
+        tools.append(&mut message_tools);
+        let has_tools = !tools.is_empty();
+        let has_tool_context = has_tools || has_tool_messages;
         normalize_reasoning_content(
             &mut messages,
             thinking_mode,
@@ -90,6 +101,7 @@ impl ProtocolRequest for ChatCompletionRequest {
             ));
         }
         let (tools, tool_choice) = convert_tools(tools, self.tool_choice, thinking_mode)?;
+        normalize_message_tools(&mut messages, &tools);
         if json_mode && is_prefix_continuation {
             return Err(ConversionError::bad_request(
                 "response_format json_object should not be used with prefix",
@@ -252,7 +264,7 @@ fn validate_prefix(messages: &[InputMessage]) -> Result<bool, ConversionError> {
 /// returns no tool definitions; [`convert_client_tools`] resolves the other
 /// choices.
 fn convert_tools(
-    tools: Vec<ChatCompletionTool>,
+    tools: Vec<ClientToolDeclaration>,
     choice: Option<ChatCompletionToolChoiceOption>,
     thinking_mode: bool,
 ) -> Result<(Vec<ToolDefinition>, ToolChoice), ConversionError> {
@@ -262,16 +274,6 @@ fn convert_tools(
     if tools.is_empty() {
         return Ok((Vec::new(), ToolChoice::Auto));
     }
-    let tools = tools
-        .into_iter()
-        .map(|tool| ClientToolDeclaration {
-            name: tool.function.name,
-            description: tool.function.description,
-            parameters: tool.function.parameters,
-            strict: tool.function.strict,
-            defer_loading: false,
-        })
-        .collect();
     let choice = match choice {
         Some(ChatCompletionToolChoiceOption::Named { function, .. }) => {
             ClientToolChoice::Named(function.name)
@@ -280,6 +282,47 @@ fn convert_tools(
         _ => ClientToolChoice::Auto,
     };
     convert_client_tools(tools, choice, thinking_mode)
+}
+
+fn client_tool(tool: ChatCompletionTool, defer_loading: bool) -> ClientToolDeclaration {
+    ClientToolDeclaration {
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+        strict: tool.function.strict,
+        defer_loading,
+    }
+}
+
+/// Declare the tools of system message `message_index` in `declarations`.
+///
+/// A model with mid-conversation system messages defers loading them, and the
+/// returned definitions disclose them at the message. Another model declares
+/// them as request tools, and the message discloses none.
+///
+/// # Errors
+///
+/// Returns an error for an invalid tool name.
+fn declare_message_tools(
+    tools: Vec<ChatCompletionTool>,
+    message_index: usize,
+    model_version: ModelVersion,
+    declarations: &mut Vec<ClientToolDeclaration>,
+) -> Result<Option<Vec<ToolDefinition>>, ConversionError> {
+    let deferred = model_version.supports_mid_conversation_system();
+    let mut disclosed = Vec::new();
+    for (tool_index, tool) in tools.into_iter().enumerate() {
+        validate_tool_name(
+            &tool.function.name,
+            &format!("messages[{message_index}].tools[{tool_index}].function"),
+        )?;
+        let declaration = client_tool(tool, deferred);
+        if deferred {
+            disclosed.push(ToolDefinition::from(&declaration));
+        }
+        declarations.push(declaration);
+    }
+    Ok((!disclosed.is_empty()).then_some(disclosed))
 }
 
 impl ChatCompletionRequestContent {
@@ -396,10 +439,11 @@ fn strip_billing_header(mut content: Prompt) -> Prompt {
 /// Convert the request messages into conversation messages.
 ///
 /// A `system` message becomes a system message without an Anthropic billing
-/// header, or nothing when its content is then empty. A `user` message becomes
-/// a user message, and a `latest_reminder` message a reminder. An `assistant`
-/// message becomes an assistant message with its tool calls, followed by one
-/// tool message per `tool` message that answers those calls.
+/// header, or nothing when it then has neither content nor tools to disclose;
+/// [`declare_message_tools`] declares its tools in `message_tools`. A `user`
+/// message becomes a user message, and a `latest_reminder` message a reminder.
+/// An `assistant` message becomes an assistant message with its tool calls,
+/// followed by one tool message per `tool` message that answers those calls.
 ///
 /// # Errors
 ///
@@ -411,11 +455,13 @@ fn strip_billing_header(mut content: Prompt) -> Prompt {
 /// call, each answering a distinct call of that message; when a `tool` message
 /// does not follow such an `assistant` message; or when, for a model with
 /// image input, an `image_url` or `file` block is invalid, including a system,
-/// user, or tool data URL that fails [`validate_data_url_sources`].
+/// user, or tool data URL that fails [`validate_data_url_sources`]; or when a
+/// `system` message declares a tool with an invalid name.
 fn transform_messages(
     messages: Vec<ChatCompletionRequestMessage>,
     image_token: &str,
     model_version: ModelVersion,
+    message_tools: &mut Vec<ClientToolDeclaration>,
 ) -> Result<Vec<InputMessage>, ConversionError> {
     if messages.is_empty() {
         return Err(ConversionError::bad_request("Empty input messages"));
@@ -425,16 +471,22 @@ fn transform_messages(
     let mut message_iter = messages.into_iter().enumerate();
     while let Some((index, message)) = message_iter.next() {
         match message {
-            ChatCompletionRequestMessage::System { content, .. } => {
+            ChatCompletionRequestMessage::System { content, tools, .. } => {
                 let (content, image_sources) =
                     content.into_content(index, image_token, model_version)?;
                 let content = strip_billing_header(content);
-                if !content.is_empty() {
+                let tools = declare_message_tools(
+                    tools.unwrap_or_default(),
+                    index,
+                    model_version,
+                    message_tools,
+                )?;
+                if !content.is_empty() || tools.is_some() {
                     validate_data_url_sources(&image_sources, &format!(".messages[{index}]"))?;
                     result.push(InputMessage::System {
                         content,
                         image_sources,
-                        tools: None,
+                        tools,
                     });
                 }
             }

@@ -222,6 +222,53 @@ def test_deferred_loading_follows_model_version(model, deferred):
     assert '"name": "lookup"' in prompt
 
 
+def chat_completion_tool(name):
+    return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+
+@pytest.mark.parametrize(
+    "model,deferred",
+    [
+        ("DeepSeek-V4-Pro", False),
+        ("DeepSeek-V4.1-Flash", True),
+    ],
+)
+def test_chat_completion_system_message_tools_follow_model_version(model, deferred):
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "", "tools": [chat_completion_tool("lookup")]},
+        ],
+        "tools": [chat_completion_tool("search")],
+    }
+    converted = ChatCompletionRequest(body).convert(ConversionOptions())
+    encoding = DeepseekV41Encoding() if deferred else DeepseekV4Encoding()
+    prompt = encoding.render_conversation(converted.conversation).prompt
+
+    assert converted.conversation.tools[1].defer_loading is deferred
+    assert ("### Updated Tool Schemas" in prompt) is deferred
+    assert '"name": "lookup"' in prompt
+
+
+def test_chat_completion_system_message_tools_without_request_tools():
+    body = {
+        "model": "DeepSeek-V4.1-Flash",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "", "tools": [chat_completion_tool("lookup")]},
+        ],
+    }
+    converted = ChatCompletionRequest(body).convert(ConversionOptions())
+    prompt = DeepseekV41Encoding().render_conversation(converted.conversation).prompt
+
+    assert (
+        prompt.index("## Tools")
+        < prompt.index("### Updated Tool Schemas")
+        < prompt.index('"name": "lookup"')
+    )
+
+
 def test_web_search_conversion_options():
     defaults = ConversionOptions()
     constructed = ConversionOptions(

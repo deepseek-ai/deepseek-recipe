@@ -66,6 +66,10 @@ pub enum ChatCompletionRequestMessage {
     System {
         content: ChatCompletionRequestContent,
         name: Option<String>,
+        /// Tools the conversation discloses at this message. A model with
+        /// mid-conversation system messages loads them there; another model
+        /// receives them with the request tools.
+        tools: Option<Vec<ChatCompletionTool>>,
     },
     User {
         content: ChatCompletionRequestContent,
