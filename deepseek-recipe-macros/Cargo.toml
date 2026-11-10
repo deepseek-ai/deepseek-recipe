@@ -1,0 +1,17 @@
+[package]
+name = "deepseek-recipe-macros"
+version.workspace = true
+edition.workspace = true
+description = "Procedural macros for deepseek-recipe: the `prompt!` template macro and the `UntaggedDeserialize` derive."
+readme.workspace = true
+documentation = "https://docs.rs/deepseek-recipe-macros"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

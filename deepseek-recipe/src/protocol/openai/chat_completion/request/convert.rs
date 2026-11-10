@@ -1,52 +1,164 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use deepseek_recipe_core::conversation::{Conversation, ReasoningEffort, ResponseFormat};
+use deepseek_recipe_core::conversation::{Conversation, ResponseFormat};
 use deepseek_recipe_core::messages::{InputMessage, ToolCall};
-use deepseek_recipe_core::multimodal::{IMAGE_SPECIAL_TOKEN, ImageSource};
+use deepseek_recipe_core::multimodal::{ImageSource, MAX_IMAGE_URL_LEN};
+use deepseek_recipe_core::prompt::Prompt;
+use deepseek_recipe_core::special_tokens::{SpecialToken, SpecialTokens};
 use deepseek_recipe_core::tools::{ToolChoice, ToolDefinition};
 
-use crate::protocol::image::{
-    data_url_image_source, file_id_unsupported, image_not_allowed, image_url_source,
+use crate::protocol::client_tools::{
+    ClientToolChoice, ClientToolDeclaration, convert_client_tools,
 };
+use crate::protocol::image::{
+    UNSUPPORTED_IMAGE_PLACEHOLDER, file_data_image_source, file_id_unsupported, image_url_source,
+    validate_data_url_sources,
+};
+use crate::protocol::output_constraint::resolve_output_constraint;
+use crate::protocol::reasoning::resolve_thinking_mode;
+use crate::protocol::reasoning_content::normalize_reasoning_content;
 use crate::protocol::validation::{
-    contains_json_instruction, image_special_token_not_allowed, validate_max_tokens,
-    validate_sampling, validate_tool_name, validate_tool_parameters, validate_tool_text,
+    RawInferenceOptions, contains_json_instruction, validate_response_schema,
+    validate_stop_sequence, validate_stop_sequences, validate_tool_name,
 };
 use crate::request::{
-    ConversationRequest, ConversionError, ConversionOptions, InferenceOptions, ProtocolRequest,
+    ConversationRequest, ConversionError, ConversionOptions, ModelVersion, ProtocolRequest,
+    ResponseOptions,
 };
-use crate::stream::state_machine::{ParsingOptions, ReasoningStage};
+use crate::stream::{ParsingOptions, ThinkingInitialStage};
 
 use super::super::response::{ChatCompletionChunkGenerator, ChatCompletionResponse};
 use super::schema::{
-    ChatCompletionReasoningEffort, ChatCompletionRequest, ChatCompletionRequestContent,
-    ChatCompletionRequestContentBlock, ChatCompletionRequestMessage, ChatCompletionResponseFormat,
-    ChatCompletionStopSequences, ChatCompletionStreamOptions, ChatCompletionThinkingType,
-    ChatCompletionTool, ChatCompletionToolChoiceMode, ChatCompletionToolChoiceOption,
+    ChatCompletionRequest, ChatCompletionRequestContent, ChatCompletionRequestContentBlock,
+    ChatCompletionRequestMessage, ChatCompletionResponseFormat, ChatCompletionStopSequences,
+    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
 };
-
-/// Maximum number of stop sequences accepted by the adapter.
-const MAX_STOP_SEQUENCES: usize = 16;
 
 impl ProtocolRequest for ChatCompletionRequest {
     type Response = ChatCompletionResponse;
 
+    /// Validate and convert Chat Completions input into a conversation request.
+    ///
+    /// Checks run in the order model name, tool names, messages, reasoning
+    /// content, prefix continuation, JSON instruction, tool schemas and tool
+    /// choice, prefix combinations, stop sequences and stream options, response
+    /// format, and sampling parameters.
     fn convert(self, options: ConversionOptions) -> Result<ConversationRequest, ConversionError> {
-        let (thinking_mode, reasoning_effort) = self.resolve_thinking(options);
-        let mut parsing_options = self.parsing_options(thinking_mode);
-        let inference_options = self.inference_options()?;
+        let model_version = options.resolve_model_version(&self.model)?;
+        let (thinking_mode, reasoning_effort) = resolve_thinking_mode(
+            options.default_thinking_mode,
+            self.thinking.as_ref().map(|thinking| thinking.r#type),
+            self.reasoning_effort,
+        );
+        let tools = self.tools.unwrap_or_default();
+        for (index, tool) in tools.iter().enumerate() {
+            validate_tool_name(&tool.function.name, &format!("tools[{index}].function"))?;
+        }
+        let has_tools = !tools.is_empty();
+        let has_tool_context = has_tools
+            || self.messages.iter().any(|message| {
+                matches!(
+                    message,
+                    ChatCompletionRequestMessage::Assistant {
+                        tool_calls: Some(_),
+                        ..
+                    } | ChatCompletionRequestMessage::Tool { .. }
+                )
+            });
+        let image_token = options.special_tokens.token(SpecialToken::Image);
+        let mut messages = transform_messages(self.messages, image_token, model_version)?;
+        normalize_reasoning_content(
+            &mut messages,
+            thinking_mode,
+            has_tools,
+            options.reasoning_content_behavior,
+        )
+        .map_err(|()| {
+            ConversionError::bad_request(
+                "The `reasoning_content` in the thinking mode must be passed back to the API.",
+            )
+        })?;
+        let is_prefix_continuation = validate_prefix(&messages)?;
+        let json_mode = matches!(
+            self.response_format,
+            Some(ChatCompletionResponseFormat::JsonObject)
+        );
+        if json_mode && !contains_json_instruction(&messages) {
+            return Err(ConversionError::bad_request(
+                "Prompt must contain the word 'json' in some form to use 'response_format' of type 'json_object'.",
+            ));
+        }
+        let (tools, tool_choice) = convert_tools(tools, self.tool_choice, thinking_mode)?;
+        if json_mode && is_prefix_continuation {
+            return Err(ConversionError::bad_request(
+                "response_format json_object should not be used with prefix",
+            ));
+        }
+        if has_tool_context && is_prefix_continuation {
+            return Err(ConversionError::bad_request(
+                "Function call should not be used with prefix",
+            ));
+        }
         validate_api_params(
             self.stop.as_ref(),
             self.stream,
             self.stream_options.as_ref(),
         )?;
-        let (tools, tool_choice) = convert_tools(self.tools, self.tool_choice, thinking_mode)?;
-        parsing_options.parse_tool_calls = !tools.is_empty() && tool_choice != ToolChoice::None;
-        parsing_options.tool_call_initial_stage = tool_choice == ToolChoice::Required;
-        let messages = transform_messages(self.messages)?;
-        validate_tool_text(&tools, &messages)?;
-        let response_format = convert_response_format(&messages, self.response_format)?;
-        parsing_options.parse_json_output = matches!(response_format, ResponseFormat::JsonObject);
+        let has_response_format = self.response_format.is_some();
+        let (response_format, constraint_format) = match self.response_format {
+            Some(ChatCompletionResponseFormat::JsonObject) => {
+                (ResponseFormat::JsonObject, ResponseFormat::JsonObject)
+            }
+            Some(ChatCompletionResponseFormat::JsonSchema { json_schema }) => {
+                let constraint_schema =
+                    validate_response_schema(&json_schema.schema, json_schema.strict)?;
+                (
+                    ResponseFormat::JsonSchema(json_schema.schema),
+                    ResponseFormat::JsonSchema(constraint_schema),
+                )
+            }
+            Some(ChatCompletionResponseFormat::Regex { regex }) => (
+                ResponseFormat::Regex(regex.clone()),
+                ResponseFormat::Regex(regex),
+            ),
+            Some(ChatCompletionResponseFormat::Text) | None => {
+                (ResponseFormat::Text, ResponseFormat::Text)
+            }
+        };
+        let output_constraint = resolve_output_constraint(
+            &tools,
+            tool_choice,
+            &constraint_format,
+            has_response_format,
+        )?;
+        let mut inference_options = RawInferenceOptions {
+            thinking_mode,
+            n: self.n,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            logprobs: self.logprobs,
+            top_logprobs: self.top_logprobs,
+            max_tokens: self.max_tokens,
+            clamp_max_tokens: false,
+            seed: self.seed,
+        }
+        .into_inference_options(options.resolve_max_tokens_upper_bound(thinking_mode))?;
+
+        let parse_tool_calls = !tools.is_empty() && tool_choice != ToolChoice::None;
+        inference_options.top_p =
+            Some(model_version.resolve_top_p(self.top_p, thinking_mode, parse_tool_calls));
+        inference_options.output_constraint = output_constraint;
+        let parsing_options = ParsingOptions {
+            parse_tool_calls,
+            starts_in_tool_calls: tool_choice == ToolChoice::Required,
+            parse_json_output: json_mode,
+            thinking_initial_stage: thinking_mode.then(|| thinking_initial_stage(&messages)),
+            stop_sequences: self.stop.map(Vec::<String>::from).unwrap_or_default(),
+            special_tokens: Arc::clone(&options.special_tokens),
+        };
         Ok(ConversationRequest {
             conversation: Conversation {
                 messages,
@@ -58,296 +170,277 @@ impl ProtocolRequest for ChatCompletionRequest {
             },
             inference_options,
             parsing_options,
-            model: Some(self.model),
+            model_version,
             stream: self.stream.unwrap_or(false),
+            response_options: ResponseOptions {
+                include_usage: self
+                    .stream_options
+                    .and_then(|options| options.include_usage)
+                    .unwrap_or(false),
+                ..ResponseOptions::default()
+            },
         })
     }
 
     fn chunk_generator(
         request: &ConversationRequest,
-        id: String,
+        response_id: String,
         model: String,
     ) -> ChatCompletionChunkGenerator {
         ChatCompletionChunkGenerator::new(
-            id,
+            response_id,
             model,
-            !request.stream,
+            !request.stream || request.response_options.include_usage,
             request.conversation.thinking_mode,
         )
-    }
-}
-
-impl ChatCompletionRequest {
-    fn resolve_thinking(&self, options: ConversionOptions) -> (bool, Option<ReasoningEffort>) {
-        let effort = self
-            .reasoning_effort
-            .and_then(ChatCompletionReasoningEffort::to_reasoning_effort);
-        let thinking = match self.thinking.as_ref().map(|thinking| thinking.kind) {
-            Some(ChatCompletionThinkingType::Enabled) => true,
-            Some(ChatCompletionThinkingType::Disabled) => false,
-            None => match self.reasoning_effort {
-                Some(ChatCompletionReasoningEffort::None) => false,
-                Some(_) => true,
-                None => options.default_thinking_mode,
-            },
-        };
-        (
-            thinking,
-            thinking.then_some(effort.unwrap_or(ReasoningEffort::High)),
+        .with_starts_in_reasoning(
+            request
+                .parsing_options
+                .thinking_initial_stage
+                .is_some_and(|stage| stage.starts_in_reasoning()),
         )
     }
+}
 
-    fn inference_options(&self) -> Result<InferenceOptions, ConversionError> {
-        if self.n.is_some_and(|value| value != 1) {
-            return Err(ConversionError::bad_request(
-                "Invalid n value (currently only n = 1 is supported)",
-            ));
-        }
-        for (name, value) in [
-            ("frequency_penalty", self.frequency_penalty),
-            ("presence_penalty", self.presence_penalty),
-        ] {
-            if value.is_some_and(|value| !(-2.0..=2.0).contains(&value)) {
-                return Err(ConversionError::bad_request(format!(
-                    "{name} must be in [-2, 2]"
-                )));
+/// Return the initial reasoning stage of a thinking-mode request.
+///
+/// A final prefix message with content continues the answer; one with only
+/// reasoning content continues the reasoning. Otherwise reasoning starts.
+fn thinking_initial_stage(messages: &[InputMessage]) -> ThinkingInitialStage {
+    match messages.last() {
+        Some(InputMessage::Assistant {
+            content,
+            reasoning_content,
+            prefix: true,
+            ..
+        }) => {
+            if !content.is_empty() {
+                ThinkingInitialStage::ContentContinuation
+            } else if reasoning_content
+                .as_ref()
+                .is_some_and(|reasoning_content| !reasoning_content.is_empty())
+            {
+                ThinkingInitialStage::ReasoningContinuation
+            } else {
+                ThinkingInitialStage::ReasoningStart
             }
         }
-        validate_max_tokens(self.max_tokens, "max_tokens")?;
-        validate_sampling(self.temperature, self.top_p)?;
-        if self.seed.is_some_and(|value| value >= 1u64 << 63) {
-            return Err(ConversionError::bad_request("seed must be in [0, 2^63)"));
-        }
-        Ok(InferenceOptions {
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-            top_p: self.top_p,
-            ..InferenceOptions::default()
-        })
-    }
-
-    fn parsing_options(&self, thinking: bool) -> ParsingOptions {
-        ParsingOptions {
-            reasoning_initial_stage: thinking.then_some(ReasoningStage::Start),
-            stop_sequences: self
-                .stop
-                .clone()
-                .map(Vec::<String>::from)
-                .unwrap_or_default(),
-            ..ParsingOptions::default()
-        }
-    }
-
-    /// Return the setting for usage inclusion in response chunks.
-    ///
-    /// Read this before consuming the request with `convert`, then pass the value
-    /// to `ChatCompletionChunkGenerator::with_include_usage`.
-    pub fn include_usage(&self) -> bool {
-        self.stream != Some(true)
-            || self
-                .stream_options
-                .as_ref()
-                .and_then(|options| options.include_usage)
-                .unwrap_or(false)
+        _ => ThinkingInitialStage::ReasoningStart,
     }
 }
 
-fn convert_tools(
-    tools: Option<Vec<ChatCompletionTool>>,
-    choice: Option<ChatCompletionToolChoiceOption>,
-    thinking: bool,
-) -> Result<(Vec<ToolDefinition>, ToolChoice), ConversionError> {
-    let tools = tools.unwrap_or_default();
-    for (index, tool) in tools.iter().enumerate() {
-        validate_tool_name(&tool.function.name, &format!("tools.{index}.function.name"))?;
+/// Validate prefix continuation, returning whether it is requested. Only the
+/// final message can request prefix continuation.
+fn validate_prefix(messages: &[InputMessage]) -> Result<bool, ConversionError> {
+    let Some(index) = messages
+        .iter()
+        .position(|message| matches!(message, InputMessage::Assistant { prefix: true, .. }))
+    else {
+        return Ok(false);
+    };
+    if index != messages.len() - 1 {
+        return Err(ConversionError::bad_request(
+            "Invalid completion message: prefix set true with message which is not final message or message role is not assistant",
+        ));
     }
-    if matches!(
-        choice,
-        Some(ChatCompletionToolChoiceOption::Mode(
-            ChatCompletionToolChoiceMode::None
-        ))
-    ) {
+    Ok(true)
+}
+
+/// Validate tool schemas and resolve the tool choice.
+///
+/// A `none` choice or a request without tools skips the schema checks and
+/// returns no tool definitions; [`convert_client_tools`] resolves the other
+/// choices.
+fn convert_tools(
+    tools: Vec<ChatCompletionTool>,
+    choice: Option<ChatCompletionToolChoiceOption>,
+    thinking_mode: bool,
+) -> Result<(Vec<ToolDefinition>, ToolChoice), ConversionError> {
+    if matches!(choice, Some(ChatCompletionToolChoiceOption::None)) {
         return Ok((Vec::new(), ToolChoice::None));
     }
     if tools.is_empty() {
         return Ok((Vec::new(), ToolChoice::Auto));
     }
-
-    let mut names = HashSet::new();
-    let mut definitions = Vec::new();
-    for (index, tool) in tools.into_iter().enumerate() {
-        let tool = tool.function;
-        if !names.insert(tool.name.clone()) {
-            return Err(ConversionError::bad_request("Tool names must be unique"));
-        }
-        if let Some(parameters) = &tool.parameters {
-            validate_tool_parameters(parameters, &format!("tools.{index}.function.parameters"))?;
-        }
-        definitions.push(ToolDefinition {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters.unwrap_or_else(|| serde_json::json!({})),
-            strict: tool.strict,
-        });
-    }
+    let tools = tools
+        .into_iter()
+        .map(|tool| ClientToolDeclaration {
+            name: tool.function.name,
+            description: tool.function.description,
+            parameters: tool.function.parameters,
+            strict: tool.function.strict,
+            defer_loading: false,
+        })
+        .collect();
     let choice = match choice {
-        Some(ChatCompletionToolChoiceOption::Named(named)) => {
-            let name = named.function.name;
-            if !names.contains(&name) {
-                return Err(ConversionError::bad_request(format!(
-                    "tool_choice: no tool named '{name}' was specified"
-                )));
-            }
-            definitions.retain(|tool| tool.name == name);
-            ToolChoice::Required
+        Some(ChatCompletionToolChoiceOption::Named { function, .. }) => {
+            ClientToolChoice::Named(function.name)
         }
-        Some(ChatCompletionToolChoiceOption::Mode(ChatCompletionToolChoiceMode::Required)) => {
-            ToolChoice::Required
-        }
-        _ => ToolChoice::Auto,
+        Some(ChatCompletionToolChoiceOption::Required) => ClientToolChoice::Required,
+        _ => ClientToolChoice::Auto,
     };
-    if choice == ToolChoice::Required && thinking {
-        return Err(ConversionError::bad_request(
-            "Thinking mode does not support this tool_choice",
-        ));
-    }
-    Ok((definitions, choice))
-}
-
-impl ChatCompletionReasoningEffort {
-    fn to_reasoning_effort(self) -> Option<ReasoningEffort> {
-        match self {
-            Self::None => None,
-            Self::Minimal | Self::Low => Some(ReasoningEffort::Low),
-            Self::Medium | Self::High => Some(ReasoningEffort::High),
-            Self::Xhigh => Some(ReasoningEffort::Xhigh),
-            Self::Max => Some(ReasoningEffort::Max),
-        }
-    }
+    convert_client_tools(tools, choice, thinking_mode)
 }
 
 impl ChatCompletionRequestContent {
-    /// Return whether text carries [`IMAGE_SPECIAL_TOKEN`].
-    fn contains_image_special_token(&self) -> bool {
-        match self {
-            Self::String(content) => content.contains(IMAGE_SPECIAL_TOKEN),
-            Self::List(blocks) => blocks.iter().any(|block| match block {
+    /// Convert text and image blocks of message `message_index`, joined with
+    /// blank lines. Each image block contributes one image placeholder special
+    /// token; a model without image input receives the unsupported-image text
+    /// instead. The image sources record the message's location,
+    /// `.messages[{message_index}]`.
+    fn into_content(
+        self,
+        message_index: usize,
+        image_token: &str,
+        model_version: ModelVersion,
+    ) -> Result<(Prompt, Vec<ImageSource>), ConversionError> {
+        let blocks = match self {
+            Self::String(content) => return Ok((Prompt::plain(content), Vec::new())),
+            Self::List(blocks) => blocks,
+        };
+        let path = format!(".messages[{message_index}]");
+        let supports_image = model_version.supports_image();
+        let mut contents = Vec::new();
+        let mut image_sources = Vec::new();
+        for (block_index, block) in blocks.into_iter().enumerate() {
+            match block {
                 ChatCompletionRequestContentBlock::Text { text } => {
-                    text.contains(IMAGE_SPECIAL_TOKEN)
+                    contents.push(Prompt::plain(text));
                 }
-                _ => false,
-            }),
-        }
-    }
-
-    /// Convert text and image blocks. Each image block contributes one
-    /// [`IMAGE_SPECIAL_TOKEN`] placeholder in the returned text.
-    fn into_content(self, path: &str) -> Result<(String, Vec<ImageSource>), ConversionError> {
-        match self {
-            Self::String(content) => Ok((content, Vec::new())),
-            Self::List(blocks) => {
-                let mut texts = Vec::new();
-                let mut image_sources = Vec::new();
-                for (block_index, block) in blocks.into_iter().enumerate() {
-                    match block {
-                        ChatCompletionRequestContentBlock::Text { text } => texts.push(text),
-                        ChatCompletionRequestContentBlock::ImageUrl { image_url } => {
-                            let block_path = format!("{path}.content[{block_index}].image_url.url");
-                            image_sources.push(image_url_source(
-                                image_url.url,
-                                image_url.detail,
-                                &block_path,
-                            )?);
-                            texts.push(IMAGE_SPECIAL_TOKEN.to_string());
+                ChatCompletionRequestContentBlock::ImageUrl { .. }
+                | ChatCompletionRequestContentBlock::File { .. }
+                    if !supports_image =>
+                {
+                    contents.push(Prompt::plain(UNSUPPORTED_IMAGE_PLACEHOLDER));
+                }
+                ChatCompletionRequestContentBlock::ImageUrl { image_url } => {
+                    image_sources.push(image_url_source(
+                        image_url.url,
+                        image_url.detail,
+                        &path,
+                        |length| {
+                            format!(
+                                "{path}.image_url.url[{block_index}]: image_url.url external link \
+                                 length {length} too long, max link length {MAX_IMAGE_URL_LEN}. \
+                                 Consider passing file data directly with base64 data url \
+                                 instead."
+                            )
+                        },
+                    )?);
+                    contents.push(Prompt::special(image_token));
+                }
+                ChatCompletionRequestContentBlock::File {
+                    file_id,
+                    file_data,
+                    filename,
+                } => {
+                    let error =
+                        |detail: &str| ConversionError::bad_request(format!("{path}: {detail}"));
+                    match (file_id, file_data) {
+                        (None, None) => return Err(error("file must have a file_id or file_data")),
+                        (Some(_), Some(_)) => {
+                            return Err(error("file cannot have both file_id and file_data"));
                         }
-                        ChatCompletionRequestContentBlock::File {
-                            file_id,
-                            file_data,
-                            filename: _,
-                        } => {
-                            if let Some(_file_id) = file_id {
-                                return Err(file_id_unsupported(&format!(
-                                    "{path}.content[{block_index}]"
-                                )));
-                            }
-                            let Some(file_data) = file_data else {
-                                return Err(ConversionError::bad_request(format!(
-                                    "{path}.content[{block_index}]: file must have file_data"
-                                )));
-                            };
-                            image_sources.push(data_url_image_source(file_data, None));
-                            texts.push(IMAGE_SPECIAL_TOKEN.to_string());
+                        (Some(_), None) if filename.is_some() => {
+                            return Err(error("file cannot have filename when file_id is present"));
+                        }
+                        (Some(_), None) => return Err(file_id_unsupported(&path)),
+                        (None, Some(file_data)) => {
+                            image_sources.push(file_data_image_source(file_data, &path)?);
                         }
                     }
+                    contents.push(Prompt::special(image_token));
                 }
-                Ok((texts.join("\n\n"), image_sources))
             }
         }
-    }
-
-    /// Convert text blocks and reject image blocks.
-    fn into_text(self, path: &str, role: &str) -> Result<String, ConversionError> {
-        let (content, image_sources) = self.into_content(path)?;
-        if !image_sources.is_empty() {
-            return Err(image_not_allowed(role));
-        }
-        Ok(content)
+        Ok((Prompt::join(&contents, "\n\n"), image_sources))
     }
 }
 
-/// Return whether any message carries [`IMAGE_SPECIAL_TOKEN`] in text that
-/// reaches the prompt.
+/// Convert user or tool content and validate its data URL images.
+fn convert_user_content(
+    content: ChatCompletionRequestContent,
+    message_index: usize,
+    image_token: &str,
+    model_version: ModelVersion,
+) -> Result<(Prompt, Vec<ImageSource>), ConversionError> {
+    let (content, image_sources) =
+        content.into_content(message_index, image_token, model_version)?;
+    validate_data_url_sources(&image_sources, &format!(".messages[{message_index}]"))?;
+    Ok((content, image_sources))
+}
+
+/// Remove an Anthropic billing header from system content.
 ///
-/// Message content and assistant reasoning content are checked. Tool call names
-/// and arguments are checked after conversion by [`validate_tool_text`].
-fn messages_contain_image_special_token(messages: &[ChatCompletionRequestMessage]) -> bool {
-    messages.iter().any(|message| match message {
-        ChatCompletionRequestMessage::System { content }
-        | ChatCompletionRequestMessage::User { content }
-        | ChatCompletionRequestMessage::Tool { content, .. } => {
-            content.contains_image_special_token()
+/// Content that starts with `x-anthropic-billing-header` keeps the text from
+/// the first newline or `You are`, whichever comes first, without leading
+/// whitespace. Without either, the content becomes empty.
+fn strip_billing_header(mut content: Prompt) -> Prompt {
+    let text = content.as_str();
+    if !text.starts_with("x-anthropic-billing-header") {
+        return content;
+    }
+    let start = ["\n", "You are"]
+        .iter()
+        .filter_map(|pattern| text.find(pattern))
+        .min();
+    match start {
+        Some(start) => {
+            let start = text.len() - text[start..].trim_start().len();
+            content.split_off(start)
         }
-        ChatCompletionRequestMessage::Assistant {
-            content,
-            reasoning_content,
-            ..
-        } => {
-            content
-                .as_ref()
-                .is_some_and(ChatCompletionRequestContent::contains_image_special_token)
-                || reasoning_content
-                    .as_ref()
-                    .is_some_and(|text| text.contains(IMAGE_SPECIAL_TOKEN))
-        }
-        ChatCompletionRequestMessage::LatestReminder { content } => {
-            content.contains(IMAGE_SPECIAL_TOKEN)
-        }
-    })
+        None => Prompt::new(),
+    }
 }
 
+/// Convert the request messages into conversation messages.
+///
+/// A `system` message becomes a system message without an Anthropic billing
+/// header, or nothing when its content is then empty. A `user` message becomes
+/// a user message, and a `latest_reminder` message a reminder. An `assistant`
+/// message becomes an assistant message with its tool calls, followed by one
+/// tool message per `tool` message that answers those calls.
+///
+/// # Errors
+///
+/// Returns an error when `messages` is empty; when an `assistant`
+/// message of a model with image input holds an image block; when an
+/// `assistant` message has neither `content` nor `tool_calls`, has an empty
+/// `tool_calls` list, or repeats a tool call ID; when the messages following
+/// an `assistant` message with `tool_calls` are not one `tool` message per
+/// call, each answering a distinct call of that message; when a `tool` message
+/// does not follow such an `assistant` message; or when, for a model with
+/// image input, an `image_url` or `file` block is invalid, including a system,
+/// user, or tool data URL that fails [`validate_data_url_sources`].
 fn transform_messages(
     messages: Vec<ChatCompletionRequestMessage>,
+    image_token: &str,
+    model_version: ModelVersion,
 ) -> Result<Vec<InputMessage>, ConversionError> {
     if messages.is_empty() {
         return Err(ConversionError::bad_request("Empty input messages"));
-    }
-    if messages_contain_image_special_token(&messages) {
-        return Err(image_special_token_not_allowed());
     }
 
     let mut result = Vec::new();
     let mut message_iter = messages.into_iter().enumerate();
     while let Some((index, message)) = message_iter.next() {
-        let path = format!("messages[{index}]");
         match message {
-            ChatCompletionRequestMessage::System { content } => {
-                let content = content.into_text(&path, "system")?;
+            ChatCompletionRequestMessage::System { content, .. } => {
+                let (content, image_sources) =
+                    content.into_content(index, image_token, model_version)?;
+                let content = strip_billing_header(content);
                 if !content.is_empty() {
-                    result.push(InputMessage::System { content });
+                    validate_data_url_sources(&image_sources, &format!(".messages[{index}]"))?;
+                    result.push(InputMessage::System {
+                        content,
+                        image_sources,
+                        tools: None,
+                    });
                 }
             }
-            ChatCompletionRequestMessage::User { content } => {
-                let (content, image_sources) = content.into_content(&path)?;
+            ChatCompletionRequestMessage::User { content, .. } => {
+                let (content, image_sources) =
+                    convert_user_content(content, index, image_token, model_version)?;
                 result.push(InputMessage::User {
                     content,
                     image_sources,
@@ -357,16 +450,23 @@ fn transform_messages(
                 content,
                 reasoning_content,
                 tool_calls,
+                prefix,
+                ..
             } => {
                 if content.is_none() && tool_calls.is_none() {
                     return Err(ConversionError::bad_request(
                         "Invalid assistant message: content or tool_calls must be set",
                     ));
                 }
-                let content = content
-                    .map(|content| content.into_text(&path, "assistant"))
+                let (content, image_sources) = content
+                    .map(|content| content.into_content(index, image_token, model_version))
                     .transpose()?
                     .unwrap_or_default();
+                if !image_sources.is_empty() {
+                    return Err(ConversionError::bad_request(
+                        "Image in assistant message is not supported",
+                    ));
+                }
 
                 let mut tool_results = Vec::new();
                 let mut input_tool_calls = None;
@@ -374,7 +474,7 @@ fn transform_messages(
                     let count = tool_calls.len();
                     if count == 0 {
                         return Err(ConversionError::bad_request(format!(
-                            "Invalid '{path}.tool_calls': empty array. Expected an array with minimum length 1, but got an empty \
+                            "Invalid 'messages[{index}].tool_calls': empty array. Expected an array with minimum length 1, but got an empty \
                              array instead."
                         )));
                     }
@@ -408,7 +508,7 @@ fn transform_messages(
                         if !tool_ids.contains(&tool_call_id) {
                             return Err(ConversionError::bad_request(format!(
                                 "An assistant message with 'tool_calls' must be followed by tool messages responding to each \
-                                 'tool_call_id'. Unexpected tool_call_id: {tool_call_id}"
+                                 'tool_call_id', The following tool_call_ids did not have response messages: {tool_call_id}"
                             )));
                         }
                         if checked_tool_call_ids.contains(&tool_call_id) {
@@ -418,12 +518,16 @@ fn transform_messages(
                         }
                         checked_tool_call_ids.insert(tool_call_id.clone());
 
-                        let (content, image_sources) = content
-                            .into_content(&format!("messages[{tool_result_index}].content"))?;
+                        let (content, image_sources) = convert_user_content(
+                            content,
+                            tool_result_index,
+                            image_token,
+                            model_version,
+                        )?;
                         tool_results.push(InputMessage::Tool {
                             content,
                             image_sources,
-                            tool_call_id,
+                            tool_call_id: Some(tool_call_id),
                         });
                     }
                     input_tool_calls = Some(
@@ -439,9 +543,10 @@ fn transform_messages(
                 }
 
                 result.push(InputMessage::Assistant {
-                    content,
+                    content: content.as_str().to_owned(),
                     reasoning_content,
                     tool_calls: input_tool_calls,
+                    prefix: prefix == Some(true),
                 });
                 result.extend(tool_results);
             }
@@ -460,40 +565,18 @@ fn transform_messages(
     Ok(result)
 }
 
-fn convert_response_format(
-    messages: &[InputMessage],
-    response_format: Option<ChatCompletionResponseFormat>,
-) -> Result<ResponseFormat, ConversionError> {
-    match response_format {
-        Some(ChatCompletionResponseFormat::JsonObject) => {
-            if !contains_json_instruction(messages) {
-                return Err(ConversionError::bad_request(
-                    "Prompt must contain the word 'json' in some form to use 'response_format' of type 'json_object'.",
-                ));
-            }
-            Ok(ResponseFormat::JsonObject)
-        }
-        Some(ChatCompletionResponseFormat::Regex { .. }) => Err(ConversionError::bad_request(
-            "response_format: only text and json_object are supported",
-        )),
-        Some(ChatCompletionResponseFormat::Text | ChatCompletionResponseFormat::JsonSchema)
-        | None => Ok(ResponseFormat::Text),
-    }
-}
-
 /// Validate stop sequences and streaming options.
 fn validate_api_params(
     stop: Option<&ChatCompletionStopSequences>,
     stream: Option<bool>,
     stream_options: Option<&ChatCompletionStreamOptions>,
 ) -> Result<(), ConversionError> {
-    if let Some(ChatCompletionStopSequences::Array(stop_sequences)) = stop
-        && stop_sequences.len() > MAX_STOP_SEQUENCES
-    {
-        return Err(ConversionError::bad_request(format!(
-            "ChatCompletionStopSequences string array too long: {}",
-            stop_sequences.len()
-        )));
+    match stop {
+        Some(ChatCompletionStopSequences::Array(stop_sequences)) => {
+            validate_stop_sequences(stop_sequences)?;
+        }
+        Some(ChatCompletionStopSequences::String(stop)) => validate_stop_sequence(stop)?,
+        None => {}
     }
     if stream != Some(true) && stream_options.is_some() {
         return Err(ConversionError::bad_request(
@@ -501,4 +584,28 @@ fn validate_api_params(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn billing_headers_are_stripped_from_system_content() {
+        let strip = |text: &str| {
+            strip_billing_header(Prompt::plain(text))
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(
+            strip("x-anthropic-billing-header: a\n  You are b"),
+            "You are b"
+        );
+        assert_eq!(
+            strip("x-anthropic-billing-header: aYou are b\nc"),
+            "You are b\nc"
+        );
+        assert_eq!(strip("x-anthropic-billing-header: a"), "");
+        assert_eq!(strip("system"), "system");
+    }
 }

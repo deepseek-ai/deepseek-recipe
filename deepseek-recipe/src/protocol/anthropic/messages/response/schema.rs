@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::response::Accumulate;
 use crate::response::ProtocolResponse;
 use crate::stream::{CompletionUsage, FinishReason, PromptUsage};
-use crate::util::append_delta::AppendDelta;
 
 use super::chunk_generator::MessagesChunkGenerator;
 
@@ -21,7 +21,7 @@ pub struct MessagesResponse {
     pub response_type: MessagesResponseType,
     pub role: MessagesRole,
     pub model: String,
-    pub content: Vec<MessagesResponseContent>,
+    pub content: Vec<MessagesResponseContentBlock>,
     pub stop_reason: Option<MessagesStopReason>,
     pub stop_sequence: Option<String>,
     pub usage: MessagesUsage,
@@ -44,7 +44,7 @@ pub enum MessagesRole {
 /// A complete content block, distinct from the delta applied to it.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum MessagesResponseContent {
+pub enum MessagesResponseContentBlock {
     Text {
         text: String,
     },
@@ -59,9 +59,10 @@ pub enum MessagesResponseContent {
     },
 }
 
+/// The delta of a `content_block_delta` event.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum MessagesDelta {
+pub enum MessagesContentBlockDelta {
     TextDelta { text: String },
     ThinkingDelta { thinking: String },
     SignatureDelta { signature: String },
@@ -90,13 +91,15 @@ impl From<FinishReason> for MessagesStopReason {
     }
 }
 
+/// The delta of a `message_delta` event.
 #[derive(Debug, Serialize)]
-pub struct MessagesStopInfo {
+pub struct MessagesMessageDelta {
     pub stop_reason: Option<MessagesStopReason>,
     pub stop_sequence: Option<String>,
 }
 
-/// Protocol representation of caller-supplied accounting.
+/// Token usage in Messages format. `input_tokens` excludes prompt cache hits,
+/// which `cache_read_input_tokens` reports.
 #[derive(Debug, Serialize)]
 pub struct MessagesUsage {
     pub input_tokens: usize,
@@ -136,17 +139,17 @@ pub enum MessagesStreamEvent {
     },
     ContentBlockStart {
         index: usize,
-        content_block: MessagesResponseContent,
+        content_block: MessagesResponseContentBlock,
     },
     ContentBlockDelta {
         index: usize,
-        delta: MessagesDelta,
+        delta: MessagesContentBlockDelta,
     },
     ContentBlockStop {
         index: usize,
     },
     MessageDelta {
-        delta: MessagesStopInfo,
+        delta: MessagesMessageDelta,
         usage: MessagesUsage,
     },
     MessageStop,
@@ -197,13 +200,13 @@ impl ProtocolResponse for MessagesResponse {
         }
     }
 
-    fn chunk_event_type(chunk: &MessagesStreamEvent) -> Option<&'static str> {
+    fn sse_event_name(chunk: &MessagesStreamEvent) -> Option<&'static str> {
         Some(chunk.event_type())
     }
 }
 
-impl AppendDelta<MessagesStreamEvent> for MessagesResponse {
-    fn append(&mut self, event: MessagesStreamEvent) {
+impl Accumulate<MessagesStreamEvent> for MessagesResponse {
+    fn accumulate(&mut self, event: MessagesStreamEvent) {
         match event {
             MessagesStreamEvent::MessageStart { message } => *self = message,
             MessagesStreamEvent::ContentBlockStart {
@@ -220,20 +223,20 @@ impl AppendDelta<MessagesStreamEvent> for MessagesResponse {
                 };
                 match (block, delta) {
                     (
-                        MessagesResponseContent::Text { text },
-                        MessagesDelta::TextDelta { text: value },
+                        MessagesResponseContentBlock::Text { text },
+                        MessagesContentBlockDelta::TextDelta { text: value },
                     ) => text.push_str(&value),
                     (
-                        MessagesResponseContent::Thinking { thinking, .. },
-                        MessagesDelta::ThinkingDelta { thinking: value },
+                        MessagesResponseContentBlock::Thinking { thinking, .. },
+                        MessagesContentBlockDelta::ThinkingDelta { thinking: value },
                     ) => thinking.push_str(&value),
                     (
-                        MessagesResponseContent::Thinking { signature, .. },
-                        MessagesDelta::SignatureDelta { signature: value },
+                        MessagesResponseContentBlock::Thinking { signature, .. },
+                        MessagesContentBlockDelta::SignatureDelta { signature: value },
                     ) => signature.push_str(&value),
                     (
-                        MessagesResponseContent::ToolUse { .. },
-                        MessagesDelta::InputJsonDelta { partial_json },
+                        MessagesResponseContentBlock::ToolUse { .. },
+                        MessagesContentBlockDelta::InputJsonDelta { partial_json },
                     ) => {
                         self.partial_tool_inputs
                             .entry(index)
@@ -245,7 +248,7 @@ impl AppendDelta<MessagesStreamEvent> for MessagesResponse {
             }
             MessagesStreamEvent::ContentBlockStop { index } => {
                 if let Some(json) = self.partial_tool_inputs.remove(&index)
-                    && let Some(MessagesResponseContent::ToolUse { input, .. }) =
+                    && let Some(MessagesResponseContentBlock::ToolUse { input, .. }) =
                         self.content.get_mut(index)
                 {
                     *input = serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}));

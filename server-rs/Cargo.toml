@@ -1,6 +1,6 @@
 [package]
 name = "server-rs"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "An Axum example for DeepSeek protocol conversion with mock inference."
 publish = false
@@ -10,7 +10,7 @@ axum = { workspace = true }
 deepseek-recipe = { workspace = true }
 deepseek-recipe-core = { workspace = true }
 deepseek-recipe-encoding = { workspace = true }
-deepseek-recipe-image = { version = "0.1.0", path = "../deepseek-recipe-image", features = [
+deepseek-recipe-image = { version = "0.2.0", path = "../deepseek-recipe-image", features = [
     "opencv-preprocess",
     "reqwest-fetch",
 ] }

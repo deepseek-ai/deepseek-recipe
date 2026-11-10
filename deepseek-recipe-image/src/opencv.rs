@@ -17,17 +17,19 @@ use crate::limits::PreprocessOptions;
 const PAD_COLOR: Scalar = Scalar::new(127.0, 127.0, 127.0, 0.0);
 /// Background (BGR) applied where an image has transparency: `#FDFDFD`.
 const INFERENCE_BACKGROUND: (u8, u8, u8) = (0xfd, 0xfd, 0xfd);
-/// Maximum size of one dimension of a WebP image.
+/// Maximum width or height of a WebP image in pixels.
 const WEBP_MAX_DIMENSION: i32 = 16383;
-/// Largest allocation allowed while reading only an image header.
+/// Largest allocation in bytes allowed while reading only an image header.
 const MAX_HEADER_ALLOC: u64 = 16 * 1024 * 1024;
 /// WebP quality of a preprocessed image.
 const WEBP_QUALITY: i32 = 90;
 
-/// Preprocesses images with OpenCV.
+/// An [`ImagePreprocessor`] that preprocesses images with OpenCV.
 ///
-/// Preprocessing decodes the image, applies the low-detail limit, fits the image
-/// into the V4.1 token budget, and encodes it as WebP at quality 90.
+/// Preprocessing detects the media type from the file header, rejects an image
+/// whose width or height exceeds [`PreprocessOptions::max_dimension_px`],
+/// decodes the image, applies the low-detail limit, fits the image into the
+/// V4.1 token budget, and encodes it as WebP at quality 90.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenCvImagePreprocessor;
 
@@ -39,17 +41,17 @@ impl ImagePreprocessor for OpenCvImagePreprocessor {
     ) -> Result<ImageInfo, ImageError> {
         tokio::task::spawn_blocking(move || preprocess(&data, options))
             .await
-            .map_err(|err| ImageError::Decode(err.to_string()))?
+            .map_err(|err| ImageError::decode(err.to_string()))?
     }
 }
 
 /// Preprocess one encoded image.
 fn preprocess(data: &[u8], options: PreprocessOptions) -> Result<ImageInfo, ImageError> {
     if data.is_empty() {
-        return Err(ImageError::EmptyImage);
+        return Err(ImageError::empty_image());
     }
     let media_type = detect_media_type(data)?;
-    check_dimensions(data, options.max_dimension_px)?;
+    validate_header_dimensions(data, options.max_dimension_px)?;
     let mut mat = decode_image_mat(data, media_type)?;
     if options.detail.is_low() {
         mat = limit_image_mat(mat, options.low_detail_max_dimension_px)?;
@@ -60,18 +62,18 @@ fn preprocess(data: &[u8], options: PreprocessOptions) -> Result<ImageInfo, Imag
 /// Return the media type of the image bytes, read from the file header.
 fn detect_media_type(data: &[u8]) -> Result<ImageMediaType, ImageError> {
     let kind = infer::get(data)
-        .ok_or_else(|| ImageError::UnsupportedMediaType("unknown media type".to_string()))?;
+        .ok_or_else(|| ImageError::unsupported_media_type("unknown media type".to_string()))?;
     let mime = kind.mime_type();
     ImageMediaType::from_mime(mime)
-        .ok_or_else(|| ImageError::UnsupportedMediaType(mime.to_string()))
+        .ok_or_else(|| ImageError::unsupported_media_type(mime.to_string()))
 }
 
-/// Reject an image whose declared dimensions exceed `max_dimension`, reading the
-/// file header only.
-fn check_dimensions(data: &[u8], max_dimension: u32) -> Result<(), ImageError> {
+/// Reject an image whose declared width or height exceeds `max_dimension`
+/// pixels, reading only the file header.
+fn validate_header_dimensions(data: &[u8], max_dimension: u32) -> Result<(), ImageError> {
     let mut reader = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     let mut limits = Limits::default();
     limits.max_image_width = Some(max_dimension);
     limits.max_image_height = Some(max_dimension);
@@ -80,73 +82,76 @@ fn check_dimensions(data: &[u8], max_dimension: u32) -> Result<(), ImageError> {
 
     let decoder = match reader.into_decoder() {
         Ok(decoder) => decoder,
-        Err(err) => return check_dimensions_without_limits(err, data, max_dimension),
+        Err(err) => return validate_dimensions_after_limit_error(err, data, max_dimension),
     };
     let (width, height) = decoder.dimensions();
     if width > max_dimension || height > max_dimension {
-        return Err(ImageError::ImageDimensionsTooLarge);
+        return Err(ImageError::dimensions_too_large());
     }
     Ok(())
 }
 
-/// Handle a header read that failed under the configured limits.
+/// Classify a header read that failed under the configured limits.
 ///
-/// Decoders that do not support limits report the limit as unsupported. Their
-/// dimensions are read directly instead.
-fn check_dimensions_without_limits(
+/// A dimension limit rejects the image. A decoder without limit support
+/// reports the limit as unsupported; its header is read again without limits
+/// and its dimensions are checked directly.
+fn validate_dimensions_after_limit_error(
     err: image::ImageError,
     data: &[u8],
     max_dimension: u32,
 ) -> Result<(), ImageError> {
     let image::ImageError::Limits(limit_error) = &err else {
-        return Err(ImageError::Decode(err.to_string()));
+        return Err(ImageError::decode(err.to_string()));
     };
     match limit_error.kind() {
-        image::error::LimitErrorKind::DimensionError => Err(ImageError::ImageDimensionsTooLarge),
+        image::error::LimitErrorKind::DimensionError => Err(ImageError::dimensions_too_large()),
         image::error::LimitErrorKind::Unsupported { .. } => {
             let reader = image::ImageReader::new(Cursor::new(data))
                 .with_guessed_format()
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             let decoder = reader
                 .into_decoder()
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             let (width, height) = decoder.dimensions();
             if width > max_dimension || height > max_dimension {
-                return Err(ImageError::ImageDimensionsTooLarge);
+                return Err(ImageError::dimensions_too_large());
             }
             Ok(())
         }
-        _ => Err(ImageError::Decode(err.to_string())),
+        _ => Err(ImageError::decode(err.to_string())),
     }
 }
 
 /// Decode one image into an 8-bit BGR matrix.
 ///
-/// GIF images are decoded with the `image` crate because OpenCV does not support
-/// them. Images with transparency are blended onto the inference background.
+/// The `image` crate decodes GIF images because OpenCV does not support them.
+/// Images with transparency are blended onto the inference background. A
+/// decoded image with zero width or height is rejected as
+/// [`ImageError::empty_image()`].
 fn decode_image_mat(data: &[u8], media_type: ImageMediaType) -> Result<Mat, ImageError> {
     let mat = if media_type == ImageMediaType::Gif {
         gif_to_mat(data)?
     } else {
         imgcodecs::imdecode(&Vector::from_slice(data), imgcodecs::IMREAD_UNCHANGED)
-            .map_err(|err| ImageError::Decode(err.to_string()))?
+            .map_err(|err| ImageError::decode(err.to_string()))?
     };
 
     let size = mat
         .size()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     if size.width == 0 || size.height == 0 {
-        return Err(ImageError::EmptyImage);
+        return Err(ImageError::empty_image());
     }
     normalize_decoded_mat(mat)
 }
 
-/// Reduce a decoded matrix to 8-bit BGR.
+/// Convert a decoded matrix to 8-bit BGR.
 fn normalize_decoded_mat(mat: Mat) -> Result<Mat, ImageError> {
     let mat = if mat.depth() == opencv::core::CV_16U {
         let mut mat8 = Mat::default();
         mat.convert_to(&mut mat8, opencv::core::CV_8U, 1.0 / 257.0, 0.0)
-            .map_err(|err| ImageError::Decode(err.to_string()))?;
+            .map_err(|err| ImageError::decode(err.to_string()))?;
         mat8
     } else {
         mat
@@ -162,19 +167,19 @@ fn normalize_decoded_mat(mat: Mat) -> Result<Mat, ImageError> {
             channels.push(mat);
             let mut bgr = Mat::default();
             opencv::core::merge(&channels, &mut bgr)
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             Ok(bgr)
         }
         2 => {
             let mut channels = Vector::<Mat>::new();
             opencv::core::split(&mat, &mut channels)
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             let gray = channels
                 .get(0)
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             let alpha = channels
                 .get(1)
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             let mut bgra_channels = Vector::<Mat>::new();
             bgra_channels.push(gray.clone());
             bgra_channels.push(gray.clone());
@@ -182,10 +187,10 @@ fn normalize_decoded_mat(mat: Mat) -> Result<Mat, ImageError> {
             bgra_channels.push(alpha);
             let mut bgra = Mat::default();
             opencv::core::merge(&bgra_channels, &mut bgra)
-                .map_err(|err| ImageError::Decode(err.to_string()))?;
+                .map_err(|err| ImageError::decode(err.to_string()))?;
             alpha_blend(&bgra)
         }
-        channels => Err(ImageError::Decode(format!(
+        channels => Err(ImageError::decode(format!(
             "unsupported image channel count: {channels}"
         ))),
     }
@@ -194,7 +199,7 @@ fn normalize_decoded_mat(mat: Mat) -> Result<Mat, ImageError> {
 /// Blend a 4-channel BGRA matrix onto the inference background.
 fn alpha_blend(bgra: &Mat) -> Result<Mat, ImageError> {
     if !bgra.is_continuous() {
-        return Err(ImageError::Decode(
+        return Err(ImageError::decode(
             "image matrix is not continuous".to_string(),
         ));
     }
@@ -202,14 +207,14 @@ fn alpha_blend(bgra: &Mat) -> Result<Mat, ImageError> {
     // SAFETY: the allocation is owned by the returned matrix and is fully
     // written by the loop below.
     let mut blended = unsafe { Mat::new_rows_cols(rows, cols, opencv::core::CV_8UC3) }
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
 
     let source = bgra
         .data_bytes()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     let target = blended
         .data_bytes_mut()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     let (background_b, background_g, background_r) = INFERENCE_BACKGROUND;
     let (background_b, background_g, background_r) = (
         u32::from(background_b),
@@ -230,11 +235,12 @@ fn alpha_blend(bgra: &Mat) -> Result<Mat, ImageError> {
     Ok(blended)
 }
 
-/// Scale an image down so that its long side is at most `max_dimension`.
+/// Scale an image down with area interpolation so that its long side is at
+/// most `max_dimension`.
 fn limit_image_mat(mat: Mat, max_dimension: u32) -> Result<Mat, ImageError> {
     let size = mat
         .size()
-        .map_err(|err| ImageError::Resize(err.to_string()))?;
+        .map_err(|err| ImageError::resize(err.to_string()))?;
     let long_side = size.width.max(size.height);
     if long_side <= max_dimension as i32 {
         return Ok(mat);
@@ -242,24 +248,35 @@ fn limit_image_mat(mat: Mat, max_dimension: u32) -> Result<Mat, ImageError> {
     let ratio = max_dimension as f64 / long_side as f64;
     let width = ((size.width as f64 * ratio).round() as i32).max(1);
     let height = ((size.height as f64 * ratio).round() as i32).max(1);
-    direct_resize(&mat, width, height)
+    let mut limited = Mat::default();
+    imgproc::resize(
+        &mat,
+        &mut limited,
+        opencv::core::Size::new(width, height),
+        0.0,
+        0.0,
+        imgproc::INTER_AREA,
+    )
+    .map_err(|err| ImageError::resize(err.to_string()))?;
+    Ok(limited)
 }
 
 /// Fit an image into the V4.1 token budget and encode it as WebP.
 fn preprocess_mat(mat: Mat, max_dimension_px: u32) -> Result<ImageInfo, ImageError> {
     let size = mat
         .size()
-        .map_err(|err| ImageError::Resize(err.to_string()))?;
-    // `check_dimensions` reads the size the header declares. The decoded matrix
-    // is the image the request carries, so it is checked against the limit too.
+        .map_err(|err| ImageError::resize(err.to_string()))?;
+    // `validate_header_dimensions` reads the size the header declares. The
+    // decoded matrix is the image the request carries, so it is checked
+    // against the limit too.
     let max_dimension = max_dimension_px as i32;
     if size.width > max_dimension || size.height > max_dimension {
-        return Err(ImageError::ImageDimensionsTooLarge);
+        return Err(ImageError::dimensions_too_large());
     }
     let (best_width, best_height) =
         fit_webp_target_size(size.width as usize, size.height as usize)?;
     if best_width <= 0 || best_height <= 0 {
-        return Err(ImageError::Resize(format!(
+        return Err(ImageError::resize(format!(
             "invalid target size: {best_width}x{best_height}"
         )));
     }
@@ -276,9 +293,9 @@ fn preprocess_mat(mat: Mat, max_dimension_px: u32) -> Result<ImageInfo, ImageErr
     // A false return value reports an encoding failure, leaving the output
     // buffer without an encoded image.
     let encode_succeeded = imgcodecs::imencode(".webp", &resized, &mut encoded, &params)
-        .map_err(|err| ImageError::Encode(err.to_string()))?;
+        .map_err(|err| ImageError::encode(err.to_string()))?;
     if !encode_succeeded {
-        return Err(ImageError::EncodeFailed);
+        return Err(ImageError::encode_failed());
     }
     Ok(ImageInfo {
         data: encoded.to_vec(),
@@ -292,12 +309,15 @@ fn preprocess_mat(mat: Mat, max_dimension_px: u32) -> Result<ImageInfo, ImageErr
 ///
 /// [`ImageTokenSpec::v41`] fits the token budget without a dimension limit, and
 /// an elongated image can require a side above [`WEBP_MAX_DIMENSION`]. A size
-/// outside the limit is scaled into it and placed on the patch grid, and fitting
-/// is repeated for that size, so the returned size is both a size the
+/// outside the limit is scaled into it and placed on the patch grid, and
+/// fitting is repeated for that size, so the returned size is both a size the
 /// specification leaves unchanged and a size WebP encodes.
 fn fit_webp_target_size(width: usize, height: usize) -> Result<(i32, i32), ImageError> {
-    // The specification scales a size below its minimum area back up, so the
-    // limit is reached after a few rounds that each raise the short side.
+    // The specification scales a size whose area is below its minimum up
+    // again, which can move the long side past the WebP limit. Each round
+    // rounds the short side up to the patch grid, so a later round can find a
+    // fitted size within the limit. Fitting stops with an error after six
+    // rounds without one.
     const MAX_FIT_ROUNDS: usize = 6;
 
     let spec = ImageTokenSpec::v41();
@@ -310,8 +330,9 @@ fn fit_webp_target_size(width: usize, height: usize) -> Result<(i32, i32), Image
         }
         source = scale_into_webp_limit(spec.patch_size(), fitted.best_width, fitted.best_height);
     }
-    Err(ImageError::Resize(format!(
-        "no V4.1 target size within {WEBP_MAX_DIMENSION} pixels for an image of {width}x{height} pixels"
+    Err(ImageError::resize(format!(
+        "no V4.1 target size within {WEBP_MAX_DIMENSION} pixels for an image of \
+         {width}x{height} pixels"
     )))
 }
 
@@ -371,7 +392,7 @@ fn resize_to_best(
         0.0,
         imgproc::INTER_CUBIC,
     )
-    .map_err(|err| ImageError::Resize(err.to_string()))?;
+    .map_err(|err| ImageError::resize(err.to_string()))?;
 
     let left = round_half_even((best_width - width) as f64 * 0.5);
     let top = round_half_even((best_height - height) as f64 * 0.5);
@@ -389,7 +410,7 @@ fn resize_to_best(
         opencv::core::BORDER_CONSTANT,
         PAD_COLOR,
     )
-    .map_err(|err| ImageError::Resize(err.to_string()))?;
+    .map_err(|err| ImageError::resize(err.to_string()))?;
     Ok(padded)
 }
 
@@ -404,7 +425,7 @@ fn direct_resize(mat: &Mat, width: i32, height: i32) -> Result<Mat, ImageError> 
         0.0,
         imgproc::INTER_CUBIC,
     )
-    .map_err(|err| ImageError::Resize(err.to_string()))?;
+    .map_err(|err| ImageError::resize(err.to_string()))?;
     Ok(resized)
 }
 
@@ -412,19 +433,19 @@ fn direct_resize(mat: &Mat, width: i32, height: i32) -> Result<Mat, ImageError> 
 fn gif_to_mat(data: &[u8]) -> Result<Mat, ImageError> {
     let reader = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     let format = reader
         .format()
-        .ok_or_else(|| ImageError::Decode("unknown image format".to_string()))?;
+        .ok_or_else(|| ImageError::decode("unknown image format".to_string()))?;
     if format != image::ImageFormat::Gif {
-        return Err(ImageError::Decode(format!("expected GIF, got {format:?}")));
+        return Err(ImageError::decode(format!("expected GIF, got {format:?}")));
     }
     let frame = reader
         .decode()
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     let (width, height) = (frame.width(), frame.height());
     if width == 0 || height == 0 {
-        return Err(ImageError::EmptyImage);
+        return Err(ImageError::empty_image());
     }
 
     // OpenCV expects BGRA; the `image` crate decodes to RGBA.
@@ -436,9 +457,9 @@ fn gif_to_mat(data: &[u8]) -> Result<Mat, ImageError> {
     // SAFETY: the allocation is owned by the returned matrix and is fully
     // written from `bgra` immediately below.
     let mut mat = unsafe { Mat::new_rows_cols(height as i32, width as i32, opencv::core::CV_8UC4) }
-        .map_err(|err| ImageError::Decode(err.to_string()))?;
+        .map_err(|err| ImageError::decode(err.to_string()))?;
     mat.data_bytes_mut()
-        .map_err(|err| ImageError::Decode(err.to_string()))?
+        .map_err(|err| ImageError::decode(err.to_string()))?
         .copy_from_slice(&bgra);
     Ok(mat)
 }

@@ -1,9 +1,10 @@
 //! Request handling and mock inference for the Rust HTTP server example.
 //!
-//! Requests use DeepSeek V4.1 prompt rendering, resolve images with the default
-//! image resolver, and use the server's mock inference backend. The HTTP server
-//! supports SSE and complete JSON responses for Chat Completions, Responses,
-//! and Messages. The Python example composes its own handlers and mock backend.
+//! Requests are rendered with the prompt encoding of their model version, V4 or
+//! V4.1, resolve images with the default image resolver, and use the server's
+//! mock inference backend. The HTTP server supports SSE and complete JSON
+//! responses for Chat Completions, Responses, and Messages. The Python example
+//! composes its own handlers and mock backend.
 
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -11,17 +12,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use deepseek_recipe::anthropic::MessagesRequest;
 pub use deepseek_recipe::error_response::ErrorResponse;
-use deepseek_recipe::openai::responses::response::ResponsesResponse;
 use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
 pub use deepseek_recipe::request::ConversionError;
-use deepseek_recipe::request::{ConversationRequest, ConversionOptions, ProtocolRequest};
-use deepseek_recipe::response::ProtocolResponse;
+use deepseek_recipe::request::{
+    ConversationRequest, ConversionOptions, ModelVersion, ProtocolRequest,
+};
+use deepseek_recipe::response::{Accumulate, ProtocolResponse};
 use deepseek_recipe::stream::{
     ChunkGenerator, InferenceChunk, InferenceFinishReason, PromptUsage, StreamProcessor,
 };
-use deepseek_recipe::util::append_delta::AppendDelta;
 use deepseek_recipe_core::multimodal::MultiModalData;
 use deepseek_recipe_encoding::PromptEncoding;
+use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
 use deepseek_recipe_image::{
     ImageError, ImageQuota, ImageResolver, OpenCvImagePreprocessor, ReqwestImageFetcher,
@@ -46,33 +48,44 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<String, serde_json::E
 
 /// A validated request's prompt, resolved images, and protocol response stream.
 pub struct PreparedResponse {
-    /// DeepSeek V4.1 prompt, currently unused by the mock inference backend.
+    /// The prompt rendered with the prompt encoding of the request's model
+    /// version. The mock inference backend does not read it.
     pub prompt: String,
     /// Images resolved from the request and preprocessed for the backend.
     pub multi_modal_data: MultiModalData,
-    /// Protocol events, including the terminal sentinel when required.
+    /// Protocol events as SSE frames, followed by the final SSE message when the
+    /// protocol ends its stream with one.
     pub events: ResponseStream,
+}
+
+/// Return the conversion options of the example server: the library defaults,
+/// which accept the model names `DeepSeek-V4-Pro` and `DeepSeek-V4.1-Flash`,
+/// plus the DeepSeek API model names `deepseek-v4-pro` and `deepseek-flash`.
+pub fn conversion_options() -> ConversionOptions {
+    ConversionOptions::default()
+        .with_model_alias("deepseek-v4-pro", ModelVersion::DeepseekV4Pro)
+        .with_model_alias("deepseek-flash", ModelVersion::DeepseekV41Flash)
 }
 
 /// Deserialize a protocol request and prepare the server's response.
 ///
-/// Supports `chat_completions`, `responses`, and `messages`.
-/// All protocols currently produce SSE regardless of the request's `stream`
-/// setting and use the mock backend defined in this crate.
+/// Supports `chat_completions`, `responses`, and `messages`. Every protocol
+/// produces SSE regardless of the request's `stream` setting, and uses the mock
+/// backend defined in this crate.
 ///
 /// # Errors
 ///
 /// Returns a conversion error for unknown protocols, malformed JSON, invalid
-/// requests, or unusable images. The error has status code 400 for invalid input
-/// and 500 for internal conversion failures. Validation finishes before the
-/// response stream is returned.
+/// requests, or unusable images. The error has status code 400 for invalid
+/// input and 500 for internal conversion failures. Validation finishes before
+/// the response stream is returned.
 pub async fn handle_request(
     protocol: &str,
     body: &[u8],
 ) -> Result<PreparedResponse, ConversionError> {
     match protocol {
-        "chat_completions" => parse_request(body, prepare_chat_completion_response).await,
-        "responses" => parse_request(body, prepare_responses_response).await,
+        "chat_completions" => parse_request(body, prepare_response::<ChatCompletionRequest>).await,
+        "responses" => parse_request(body, prepare_response::<ResponsesRequest>).await,
         "messages" => parse_request(body, prepare_response::<MessagesRequest>).await,
         _ => Err(ConversionError::bad_request(format!(
             "unknown protocol: {protocol}"
@@ -96,10 +109,10 @@ where
 
 /// Convert an already deserialized request and prepare the server's response.
 ///
-/// Uses [`ConversionOptions::default()`], including enabled thinking unless the
-/// protocol explicitly overrides it. Images are resolved with the default
-/// resolver. The resulting stream shares the request's resolved parsing options,
-/// including stop sequences and tool parsing.
+/// Uses [`conversion_options`], whose default thinking mode is enabled; a
+/// request that sets a thinking mode overrides it. Images are resolved with the
+/// default resolver. The resulting stream shares the request's resolved parsing
+/// options, including stop sequences and tool parsing.
 ///
 /// # Errors
 ///
@@ -110,7 +123,7 @@ where
     T: ProtocolRequest,
     <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Serialize + Send,
 {
-    let request = req.convert(ConversionOptions::default())?;
+    let request = req.convert(conversion_options())?;
     prepare_converted_response::<T>(request).await
 }
 
@@ -130,67 +143,22 @@ where
     T: ProtocolRequest,
     <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Serialize + Send,
 {
-    prepare_converted_response_with::<T>(request, |generator| generator).await
-}
-
-/// Prepare Chat Completions SSE using the request's usage inclusion setting.
-///
-/// # Errors
-///
-/// Returns the protocol conversion error before producing response events, or a
-/// conversion error with status code 400 or 500 when an image cannot be resolved
-/// or preprocessed.
-pub async fn prepare_chat_completion_response(
-    req: ChatCompletionRequest,
-) -> Result<PreparedResponse, ConversionError> {
-    let include_usage = req.include_usage();
-    let request = req.convert(ConversionOptions::default())?;
-    prepare_converted_response_with::<ChatCompletionRequest>(request, |generator| {
-        generator.with_include_usage(include_usage)
-    })
-    .await
-}
-
-/// Prepare Responses SSE using the request's custom tool declarations.
-///
-/// # Errors
-///
-/// Returns a conversion error for invalid requests or unusable images.
-pub async fn prepare_responses_response(
-    req: ResponsesRequest,
-) -> Result<PreparedResponse, ConversionError> {
-    let custom_tool_names = req.custom_tool_names();
-    let request = req.convert(ConversionOptions::default())?;
-    prepare_converted_response_with::<ResponsesRequest>(request, move |generator| {
-        generator.with_custom_tool_names(custom_tool_names)
-    })
-    .await
-}
-
-async fn prepare_converted_response_with<T>(
-    request: ConversationRequest,
-    configure_generator: impl FnOnce(
-        <T::Response as ProtocolResponse>::ChunkGenerator,
-    ) -> <T::Response as ProtocolResponse>::ChunkGenerator,
-) -> Result<PreparedResponse, ConversionError>
-where
-    T: ProtocolRequest,
-    <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Serialize + Send,
-{
-    let (prompt, multi_modal_data, processor) =
-        prepare_processor::<T>(request, configure_generator).await?;
-    let events = processor.process(mock_inference()).map(|chunk| {
-        let chunk = chunk.map_err(|error| serde_json::Error::io(std::io::Error::other(error)))?;
-        let data = serde_json::to_string(&chunk)?;
-        Ok(
-            match <T::Response as ProtocolResponse>::chunk_event_type(&chunk) {
-                Some(event_type) => format!("event: {event_type}\ndata: {data}\n\n"),
-                None => format!("data: {data}\n\n"),
-            },
-        )
-    });
-    let done = <T::Response as ProtocolResponse>::done_message()
-        .map(|message| Ok(format!("data: {message}\n\n")));
+    let (prompt, multi_modal_data, processor) = prepare_processor::<T>(request).await?;
+    let events = processor
+        .into_protocol_stream(mock_inference())
+        .map(|chunk| {
+            let chunk =
+                chunk.map_err(|error| serde_json::Error::io(std::io::Error::other(error)))?;
+            let data = serde_json::to_string(&chunk)?;
+            Ok(
+                match <T::Response as ProtocolResponse>::sse_event_name(&chunk) {
+                    Some(event_name) => format!("event: {event_name}\ndata: {data}\n\n"),
+                    None => format!("data: {data}\n\n"),
+                },
+            )
+        });
+    let done = <T::Response as ProtocolResponse>::sse_done_data()
+        .map(|done_data| Ok(format!("data: {done_data}\n\n")));
 
     Ok(PreparedResponse {
         prompt,
@@ -199,7 +167,7 @@ where
     })
 }
 
-/// Aggregate the mock inference output into a complete protocol response.
+/// Accumulate the mock inference output into a complete protocol response.
 ///
 /// The request must come from `T::convert`. Uses the same parsing and identity
 /// as [`prepare_converted_response`] without repeating protocol conversion.
@@ -209,7 +177,8 @@ where
 /// # Errors
 ///
 /// Returns a conversion error with status code 400 or 500 when an image cannot
-/// be resolved or preprocessed.
+/// be resolved or preprocessed, or with status code 500 when output processing
+/// fails.
 pub async fn complete_response<T>(
     request: ConversationRequest,
 ) -> Result<T::Response, ConversionError>
@@ -217,60 +186,33 @@ where
     T: ProtocolRequest,
     <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Send,
 {
-    complete_response_with::<T>(request, |generator| generator).await
-}
-
-/// Aggregate Responses output using the request's custom tool declarations.
-///
-/// # Errors
-///
-/// Returns a conversion error for invalid requests, unusable images, or failed
-/// output processing.
-pub async fn complete_responses_response(
-    req: ResponsesRequest,
-) -> Result<ResponsesResponse, ConversionError> {
-    let custom_tool_names = req.custom_tool_names();
-    let request = req.convert(ConversionOptions::default())?;
-    complete_response_with::<ResponsesRequest>(request, move |generator| {
-        generator.with_custom_tool_names(custom_tool_names)
-    })
-    .await
-}
-
-async fn complete_response_with<T>(
-    request: ConversationRequest,
-    configure_generator: impl FnOnce(
-        <T::Response as ProtocolResponse>::ChunkGenerator,
-    ) -> <T::Response as ProtocolResponse>::ChunkGenerator,
-) -> Result<T::Response, ConversionError>
-where
-    T: ProtocolRequest,
-    <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Send,
-{
-    let (_, _, processor) = prepare_processor::<T>(request, configure_generator).await?;
+    let (_, _, processor) = prepare_processor::<T>(request).await?;
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     let mut response = T::Response::new(MOCK_ID.into(), MOCK_MODEL.into(), created, 0, 0);
-    let mut chunks = pin!(processor.process(mock_inference()));
+    let mut chunks = pin!(processor.into_protocol_stream(mock_inference()));
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk.map_err(|error| ConversionError::internal(error.to_string()))?;
-        response.append(chunk);
+        response.accumulate(chunk);
     }
     Ok(response)
 }
 
 async fn prepare_processor<T>(
     request: ConversationRequest,
-    configure_generator: impl FnOnce(
-        <T::Response as ProtocolResponse>::ChunkGenerator,
-    ) -> <T::Response as ProtocolResponse>::ChunkGenerator,
 ) -> Result<PreparedProcessor<T::Response>, ConversionError>
 where
     T: ProtocolRequest,
 {
-    let rendered = DeepseekV41Encoding::new().render_conversation(&request.conversation);
+    // The model version of the request selects the prompt encoding.
+    let rendered = match request.model_version {
+        ModelVersion::DeepseekV4Pro => {
+            DeepseekV4Encoding::new().render_conversation(&request.conversation)
+        }
+        _ => DeepseekV41Encoding::new().render_conversation(&request.conversation),
+    };
     let resolver = default_resolver()?;
     let mut quota = ImageQuota::new();
     let multi_modal_data = resolver
@@ -282,11 +224,7 @@ where
         image_count = multi_modal_data.images.len(),
         "rendered prompt"
     );
-    let generator = configure_generator(T::chunk_generator(
-        &request,
-        MOCK_ID.into(),
-        MOCK_MODEL.into(),
-    ));
+    let generator = T::chunk_generator(&request, MOCK_ID.into(), MOCK_MODEL.into());
     Ok((
         rendered.prompt,
         multi_modal_data,
@@ -302,7 +240,9 @@ fn default_resolver()
     Ok(ImageResolver::new(fetcher, OpenCvImagePreprocessor))
 }
 
-/// Map an image failure to a conversion error. Invalid input is a client error.
+/// Map HTTP client construction and token-budget failures to 500; other image
+/// failures are invalid input (400) whose body is the error text, which names
+/// the request location of the image.
 fn image_error(error: ImageError) -> ConversionError {
     match error {
         ImageError::Client(_) | ImageError::TokenBudget(_) => {
@@ -320,11 +260,11 @@ fn mock_inference() -> impl Stream<Item = InferenceChunk> + Send {
         },
         InferenceChunk::Text {
             content: "Hello ".to_string(),
-            content_tokens: 1,
+            token_count: 1,
         },
         InferenceChunk::Text {
             content: "world!".to_string(),
-            content_tokens: 1,
+            token_count: 1,
         },
         InferenceChunk::Finish {
             finish_reason: InferenceFinishReason::Stop,

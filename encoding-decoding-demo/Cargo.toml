@@ -1,8 +1,8 @@
 [package]
 name = "encoding-decoding-demo"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
-description = "A local web interface for inspecting DeepSeek prompts and decoding model output."
+description = "A local web interface for inspecting DeepSeek prompts and parsing model output."
 publish = false
 
 [dependencies]

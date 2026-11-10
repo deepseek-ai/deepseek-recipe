@@ -17,7 +17,7 @@ pyo3::create_exception!(
 /// `body` attributes hold the HTTP status and serialized JSON error response.
 pub(crate) fn request_error(py: Python<'_>, error: RustConversionError) -> PyErr {
     let status_code = error.status_code();
-    let response = error.into_response();
+    let response = error.into_error_response();
     let body = match serde_json::to_string(&response) {
         Ok(body) => body,
         Err(error) => return pyo3::exceptions::PyRuntimeError::new_err(error.to_string()),

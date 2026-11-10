@@ -1,24 +1,35 @@
-//! Parse model output and turn it into protocol-specific response events.
+//! Parse model output and turn it into protocol response chunks.
 
-pub use decoder::TokenizerDecoder;
+use std::sync::Arc;
+
+pub use decoder::StreamTokenizer;
 pub use inference::{
     CompletionUsage, FinishReason, InferenceChunk, InferenceFinishReason, PromptUsage,
 };
+pub use logprobs::{InferenceTokenLogprob, TokenLogprob, TopLogprob};
+pub use output_parser::{ParsingOptions, ThinkingInitialStage};
 pub use processor::StreamProcessor;
 
 mod decoder;
 mod inference;
+mod logprobs;
+mod output_parser;
 mod processor;
-pub mod state_machine;
 
 /// An error that ends stream processing before normal completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
-    /// A token-id chunk arrived without an attached tokenizer.
+    /// A `Token` or `Tokens` chunk arrived without an attached tokenizer.
     MissingTokenizer,
-    /// The tokenizer failed to decode buffered token ids.
+    /// The tokenizer failed to decode buffered token IDs.
     Decode {
-        /// The decoder's failure message.
+        /// The tokenizer's failure message.
+        detail: String,
+    },
+    /// A `Tokens` chunk carried a log probability count that differs from its
+    /// token ID count.
+    LogprobCountMismatch {
+        /// Both counts.
         detail: String,
     },
 }
@@ -29,46 +40,69 @@ impl std::fmt::Display for StreamError {
             Self::MissingTokenizer => {
                 formatter.write_str("token chunk received without a tokenizer")
             }
-            Self::Decode { detail } => write!(formatter, "failed to decode token ids: {detail}"),
+            Self::Decode { detail } => write!(formatter, "failed to decode token IDs: {detail}"),
+            Self::LogprobCountMismatch { detail } => {
+                write!(formatter, "invalid log probabilities: {detail}")
+            }
         }
     }
 }
 
 impl std::error::Error for StreamError {}
 
-/// A parsed piece of model output, before protocol-specific event conversion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed piece of model output, before conversion into protocol response
+/// chunks.
+///
+/// Unless the stream ends with a [`StreamError`], [`StreamProcessor`] produces
+/// `Start` first and `Finish` last, each exactly once. A tool call produces
+/// `ToolCallBegin`, then `ToolCallNamed`, then zero or more
+/// `ToolCallArgumentsDelta` chunks; output truncated inside a tool call ends
+/// that sequence early.
+///
+/// `logprobs` holds the log probabilities of the tokens of the decoded text the
+/// content comes from. Content split from one decoded text carries the log
+/// probabilities of the whole text.
+#[derive(Debug, Clone, PartialEq)]
 pub enum OutputChunk {
+    /// Output begins.
     Start {
         system_fingerprint: Option<String>,
-        usage: PromptUsage,
+        prompt_usage: PromptUsage,
     },
-    Raw {
+    /// Answer content.
+    Content {
         content: String,
+        logprobs: Option<Arc<[TokenLogprob]>>,
     },
+    /// Reasoning content.
     Reasoning {
         content: String,
+        logprobs: Option<Arc<[TokenLogprob]>>,
     },
+    /// An `invoke` tag opened a tool call; its tool name is not complete yet.
     ToolCallBegin,
-    ToolCall {
-        tool_name: String,
-        arguments: String,
-    },
-    ToolArgumentsDelta {
-        content: String,
-    },
+    /// The tool name of the open tool call is complete. The arguments follow
+    /// in [`ToolCallArgumentsDelta`](Self::ToolCallArgumentsDelta) chunks.
+    ToolCallNamed { tool_name: String },
+    /// A piece of the JSON arguments of the open tool call.
+    ToolCallArgumentsDelta { arguments: String },
+    /// Output ends.
     Finish {
-        reason: FinishReason,
+        finish_reason: FinishReason,
+        /// The matched stop sequence, when one ended output.
         stop_sequence: Option<String>,
-        usage: CompletionUsage,
+        completion_usage: CompletionUsage,
     },
 }
 
-/// Convert parsed output into a protocol's response events.
+/// Convert parsed output chunks into a protocol's response chunks.
+///
+/// An implementation can rely on the chunk order that [`OutputChunk`]
+/// describes.
 pub trait ChunkGenerator: Send + 'static {
-    /// Event type emitted by this protocol.
+    /// The protocol's response chunk, such as an SSE event.
     type Chunk;
 
-    /// Produce zero or more events for one parsed output chunk.
+    /// Produce zero or more protocol chunks for one parsed output chunk.
     fn generate(&mut self, chunk: OutputChunk) -> impl Future<Output = Vec<Self::Chunk>> + Send;
 }

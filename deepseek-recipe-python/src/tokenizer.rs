@@ -1,4 +1,4 @@
-//! Bindings for tokenizers used to decode token-id inference chunks.
+//! Bindings for the tokenizer that prompt encoding and stream decoding use.
 
 use std::sync::Arc;
 
@@ -6,9 +6,11 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokenizers::{FromPretrainedParameters, Tokenizer};
 
-/// A HuggingFace tokenizer loaded from a `tokenizer.json` file.
+/// A Hugging Face tokenizer loaded from a `tokenizer.json` file.
 ///
-/// A stream processor uses it to decode token-id inference chunks.
+/// A prompt encoding uses it, after `with_tokenizer`, to encode conversations
+/// into token IDs. A stream processor uses it to decode the token IDs of
+/// `tokens` inference chunks.
 #[pyclass(name = "Tokenizer", module = "deepseek_recipe._native", frozen)]
 pub(crate) struct PyTokenizer {
     pub(crate) inner: Arc<Tokenizer>,
@@ -40,7 +42,7 @@ impl PyTokenizer {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
-    /// Download and cache `tokenizer.json` from the HuggingFace Hub.
+    /// Download and cache `tokenizer.json` from the Hugging Face Hub.
     #[staticmethod]
     #[pyo3(signature = (identifier, revision = None, token = None))]
     #[allow(deprecated)]
@@ -60,7 +62,14 @@ impl PyTokenizer {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
-    /// Encode text into token ids without added special tokens.
+    /// Encode `text` into token IDs with the full vocabulary, including the
+    /// added vocabulary, so a special-token spelling in `text` encodes as that
+    /// token's ID. The post-processor adds no special tokens, such as a BOS
+    /// token.
+    ///
+    /// This is not prompt encoding, which encodes plain text without the added
+    /// vocabulary: `DeepseekV4Encoding.encode` and `DeepseekV41Encoding.encode`
+    /// perform prompt encoding.
     fn encode(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
         py.detach(|| self.inner.encode(text, false))
             .map(|encoding| encoding.get_ids().to_vec())

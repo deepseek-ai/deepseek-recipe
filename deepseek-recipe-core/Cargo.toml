@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-recipe-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Shared conversation, message, and tool types for DeepSeek models."
 readme.workspace = true
@@ -9,5 +9,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+deepseek-recipe-macros = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

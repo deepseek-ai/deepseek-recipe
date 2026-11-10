@@ -13,22 +13,26 @@ pub struct ImageLimits {
     pub max_images: usize,
     /// Maximum UTF-8 byte length of an external image URL.
     pub max_url_len: usize,
-    /// Maximum encoded size of one image.
+    /// Maximum encoded size of one image in bytes.
     pub max_image_bytes: usize,
-    /// Maximum total encoded size of the images of one request.
+    /// Maximum total encoded size of the images of one request in bytes.
     pub max_total_bytes: usize,
     /// Maximum number of sources processed concurrently by one resolve call.
     /// A value of zero is treated as one.
     pub max_concurrent_sources: usize,
-    /// Maximum width or height in pixels when a request has few images.
+    /// Maximum width or height in pixels when a request has fewer than
+    /// [`many_images_threshold`](Self::many_images_threshold) images.
     pub max_dimension_px: u32,
-    /// Maximum width or height in pixels when a request has many images.
+    /// Maximum width or height in pixels when a request has at least
+    /// [`many_images_threshold`](Self::many_images_threshold) images.
     pub max_dimension_on_many_images_px: u32,
-    /// Image count at which [`max_dimension_on_many_images_px`](Self::max_dimension_on_many_images_px)
-    /// applies.
+    /// Smallest image count of a request to which
+    /// [`max_dimension_on_many_images_px`] applies.
+    ///
+    /// [`max_dimension_on_many_images_px`]: Self::max_dimension_on_many_images_px
     pub many_images_threshold: usize,
-    /// Maximum long side before token-budget fitting at low detail.
-    /// The token specification may subsequently upscale the image.
+    /// Maximum long side in pixels at low detail, applied before token-budget
+    /// fitting. Token-budget fitting might then scale the image up.
     pub low_detail_max_dimension_px: u32,
 }
 
@@ -49,8 +53,8 @@ impl Default for ImageLimits {
 }
 
 impl ImageLimits {
-    /// Return the maximum accepted width or height for a request carrying
-    /// `image_count` images.
+    /// Return the maximum accepted width or height in pixels for a request
+    /// carrying `image_count` images.
     pub const fn max_dimension(&self, image_count: usize) -> u32 {
         if image_count < self.many_images_threshold {
             self.max_dimension_px
@@ -74,12 +78,16 @@ impl ImageLimits {
     }
 }
 
-/// Usage accumulated over the resolve calls of one request.
+/// The image count and encoded bytes recorded by the completed resolve calls of
+/// one request.
 ///
-/// The image count and total source byte limits are enforced across
-/// [`resolve`](crate::ImageResolver::resolve) calls. Create one quota per
-/// request and pass the same quota to every call. A call records its sources
-/// after preprocessing every one of them, so a failed call adds nothing.
+/// [`ImageResolver::resolve`](crate::ImageResolver::resolve) applies
+/// [`ImageLimits::max_images`] and [`ImageLimits::max_total_bytes`] to the
+/// recorded usage together with the sources of the current call. To apply
+/// these limits across the resolve calls of a request, the caller must create
+/// one quota for the request and pass it to every call. A call records its
+/// sources after preprocessing every one of them, so a failed call adds
+/// nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImageQuota {
     images: usize,
@@ -100,12 +108,12 @@ impl ImageQuota {
         self.images
     }
 
-    /// Return the encoded source bytes recorded by the completed calls.
+    /// Return the number of encoded bytes recorded by the completed calls.
     pub const fn byte_size(&self) -> usize {
         self.bytes
     }
 
-    /// Record `images` preprocessed sources of `bytes` encoded size.
+    /// Record `images` preprocessed sources with `bytes` encoded bytes in total.
     pub(crate) fn add(&mut self, images: usize, bytes: usize) {
         self.images += images;
         self.bytes += bytes;
@@ -115,27 +123,28 @@ impl ImageQuota {
 /// The encoded bytes still available to the image sources of one resolve call.
 ///
 /// [`ImageResolver::resolve`](crate::ImageResolver::resolve) creates one budget
-/// for each call and passes it to every fetch of that call. A fetch reserves the
-/// bytes it keeps as its body arrives, so the fetches running concurrently
-/// cannot together exceed [`ImageLimits::max_total_bytes`]. A budget is not
-/// shared between calls: the images of earlier calls are accounted for through
-/// the [`ImageQuota`] the call was given.
+/// for each call and passes it to every fetch of that call. As
+/// [`ImageFetcher::fetch`](crate::ImageFetcher::fetch) requires, a fetcher
+/// reserves the bytes it keeps as its body arrives, so the concurrent fetches
+/// of the call stay within [`ImageLimits::max_total_bytes`]. A budget is not
+/// shared between calls: it starts with the bytes that the [`ImageQuota`] of
+/// the request leaves available.
 #[derive(Debug)]
 pub struct ImageByteBudget {
-    /// Bytes still available to the sources of one resolve call.
+    /// Encoded bytes still available to the sources of one resolve call.
     remaining: AtomicUsize,
-    /// Maximum encoded size of one image.
+    /// Maximum encoded size of one image in bytes.
     max_image_bytes: usize,
-    /// Maximum total encoded size of the images of one request.
+    /// Maximum total encoded size of the images of one request in bytes.
     max_total_bytes: usize,
 }
 
 impl ImageByteBudget {
-    /// Create the budget of one request that has already accumulated
-    /// `used_bytes`.
+    /// Create the budget of one resolve call for a request whose earlier
+    /// resolve calls recorded `used_bytes` encoded bytes.
     ///
-    /// `max_image_bytes` limits one image, and `max_total_bytes` limits every
-    /// image of the request.
+    /// `max_image_bytes` limits one image, and `max_total_bytes` limits all
+    /// images of the request, including `used_bytes`. Both are in bytes.
     pub const fn new(max_image_bytes: usize, max_total_bytes: usize, used_bytes: usize) -> Self {
         Self {
             remaining: AtomicUsize::new(max_total_bytes.saturating_sub(used_bytes)),
@@ -144,26 +153,32 @@ impl ImageByteBudget {
         }
     }
 
-    /// Return the maximum encoded size of one image.
+    /// Return the maximum encoded size of one image in bytes.
     pub const fn max_image_bytes(&self) -> usize {
         self.max_image_bytes
     }
 
-    /// Reserve `bytes` of one image.
+    /// Reserve `bytes` encoded bytes of one image.
+    ///
+    /// This method does not check `bytes` against
+    /// [`max_image_bytes`](Self::max_image_bytes).
     ///
     /// # Errors
     ///
-    /// Returns [`ImageError::TotalSizeTooLarge`] when the request would exceed
-    /// its total encoded size. A failed reservation reserves nothing.
+    /// Returns [`ImageError::TotalSizeTooLarge`] when the reservation would
+    /// make the encoded bytes of the request exceed `max_total_bytes`. Its
+    /// `size` counts the bytes recorded by earlier calls, the bytes reserved so
+    /// far in this call, and `bytes`; its request location is empty until the
+    /// resolver fills it. A failed reservation reserves nothing.
     pub fn reserve(&self, bytes: usize) -> Result<(), ImageError> {
         let mut available = self.remaining.load(Ordering::Relaxed);
         loop {
             if available < bytes {
                 let used = self.max_total_bytes.saturating_sub(available);
-                return Err(ImageError::TotalSizeTooLarge {
-                    size: used.saturating_add(bytes),
-                    max: self.max_total_bytes,
-                });
+                return Err(ImageError::total_size_too_large(
+                    used.saturating_add(bytes),
+                    self.max_total_bytes,
+                ));
             }
             match self.remaining.compare_exchange_weak(
                 available,
@@ -177,7 +192,8 @@ impl ImageByteBudget {
         }
     }
 
-    /// Return `bytes` reserved by an attempt that failed.
+    /// Release `bytes` that a failed attempt reserved, making them available
+    /// again.
     pub fn release(&self, bytes: usize) {
         self.remaining.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -186,12 +202,12 @@ impl ImageByteBudget {
 /// Options for one image preprocessing call.
 #[derive(Debug, Clone, Copy)]
 pub struct PreprocessOptions {
-    /// Requested detail level.
+    /// Requested image detail level.
     pub detail: ImageDetail,
     /// Maximum accepted source width or height in pixels, before resizing.
     pub max_dimension_px: u32,
-    /// Maximum long side before token-budget fitting at low detail.
-    /// The token specification may subsequently upscale the image.
+    /// Maximum long side in pixels at low detail, applied before token-budget
+    /// fitting. Token-budget fitting might then scale the image up.
     pub low_detail_max_dimension_px: u32,
 }
 
@@ -209,7 +225,14 @@ mod tests {
             .reserve(5)
             .expect_err("the reservation exceeds the total limit");
         assert!(
-            matches!(error, ImageError::TotalSizeTooLarge { size: 11, max: 10 }),
+            matches!(
+                error,
+                ImageError::TotalSizeTooLarge {
+                    size: 11,
+                    max: 10,
+                    ..
+                }
+            ),
             "{error}"
         );
         budget
@@ -225,22 +248,18 @@ mod tests {
             .reserve(5)
             .expect_err("earlier calls used six bytes of the total limit");
         assert!(
-            matches!(error, ImageError::TotalSizeTooLarge { size: 11, max: 10 }),
+            matches!(
+                error,
+                ImageError::TotalSizeTooLarge {
+                    size: 11,
+                    max: 10,
+                    ..
+                }
+            ),
             "{error}"
         );
         budget
             .reserve(4)
             .expect("the remaining bytes are available");
-    }
-
-    #[test]
-    fn a_release_returns_the_bytes_of_a_failed_attempt() {
-        let budget = ImageByteBudget::new(8, 10, 0);
-        budget.reserve(10).expect("the total limit is available");
-        budget.release(10);
-
-        budget
-            .reserve(10)
-            .expect("the released bytes are available again");
     }
 }

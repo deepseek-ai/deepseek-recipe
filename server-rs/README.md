@@ -1,12 +1,16 @@
 # server-rs
 
-An Axum API example using the Rust components with mock inference.
-Requests use DeepSeek V4.1 prompt rendering and OpenCV image preprocessing.
+An Axum API example using the Rust components with mock inference. The
+request's model name selects the DeepSeek V4 or V4.1 prompt encoding:
+`DeepSeek-V4-Pro` and `deepseek-v4-pro` select V4, `DeepSeek-V4.1-Flash` and
+`deepseek-flash` select V4.1, and conversion rejects any other name with a
+`400` error. Images use OpenCV preprocessing.
 
 ## Usage
 
-Install the [Rust and OpenCV prerequisites](../docs/development.md#native-dependencies), then run
-from the repository root:
+Install the
+[Rust and OpenCV prerequisites](../docs/development.md#native-dependencies),
+then run from the repository root:
 
 ```sh
 cargo run -p server-rs --locked
@@ -31,7 +35,8 @@ curl http://127.0.0.1:7777/v1/chat/completions \
 ```
 
 The response contains the mock answer `Hello world!`. Set `"stream":true` and
-add `-N` to curl to inspect SSE output. No API key or model weights are required.
+add `-N` to curl to inspect SSE output. No API key or model weights are
+required.
 
 ## Deployment scope
 

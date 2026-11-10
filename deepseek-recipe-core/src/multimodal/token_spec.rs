@@ -1,4 +1,4 @@
-//! Image token accounting for DeepSeek V4.1.
+//! Image token counts for DeepSeek V4.1.
 
 use std::fmt;
 
@@ -13,8 +13,9 @@ pub struct ResizeResult {
     pub best_height: usize,
     /// Resized image width in pixels.
     pub best_width: usize,
-    /// Total number of model tokens for the image.
-    pub num_tokens: usize,
+    /// Image token count: the number of tokens the resized image occupies in
+    /// the inference input.
+    pub token_count: usize,
 }
 
 /// Failure to fit an image into the token budget.
@@ -45,8 +46,8 @@ impl std::error::Error for CalcResizeError {}
 
 /// DeepSeek V4.1 image token specification.
 ///
-/// The specification maps an image size to the number of model tokens the image
-/// occupies. V4.1 uses 14-pixel patches and a spatial downsample ratio of 3.
+/// The specification maps an image size to its image token count. V4.1 uses
+/// 14-pixel patches and a spatial downsample ratio of 3.
 /// Images with a positive area below 544 * 544 pixels are upscaled before
 /// patch alignment and token-budget fitting. This is an area target, not a
 /// minimum for each dimension; token-budget fitting can reduce it further.
@@ -54,31 +55,32 @@ impl std::error::Error for CalcResizeError {}
 pub struct ImageTokenSpec {
     patch_size: usize,
     downsample_ratio: usize,
-    max_n_token: usize,
+    max_token_count: usize,
     min_pixels: usize,
 }
 
 impl ImageTokenSpec {
-    /// Return the specification of DeepSeek V4.1 image tokens.
+    /// Return the DeepSeek V4.1 image token specification.
     ///
     /// Images are divided into 14-pixel patches, downsampled by 3 in each
-    /// dimension, and limited to 1024 model tokens. Images with a positive area
-    /// below 544 * 544 pixels are upscaled before alignment and budget fitting.
+    /// dimension, and limited to an image token count of 1024. Images with a
+    /// positive area below 544 * 544 pixels are upscaled before alignment and
+    /// budget fitting.
     pub const fn v41() -> Self {
         Self {
             patch_size: 14,
             downsample_ratio: 3,
-            max_n_token: 1024,
+            max_token_count: 1024,
             min_pixels: 544 * 544,
         }
     }
 
-    /// Return the maximum number of model tokens one image may occupy.
-    pub const fn max_n_token(&self) -> usize {
-        self.max_n_token
+    /// Return the maximum image token count of one image.
+    pub const fn max_token_count(&self) -> usize {
+        self.max_token_count
     }
 
-    /// Return the pixel size of one patch.
+    /// Return the side length of one square patch in pixels.
     pub const fn patch_size(&self) -> usize {
         self.patch_size
     }
@@ -89,26 +91,28 @@ impl ImageTokenSpec {
         self.downsample_ratio
     }
 
-    /// Return the model tokens one image of `width`×`height` pixels occupies.
+    /// Return the image token count of an image of `width`×`height` pixels:
+    /// the number of tokens it occupies in the inference input.
     ///
     /// # Errors
     ///
     /// Returns [`CalcResizeError`] when fitting the image does not converge.
-    pub fn calc_token_len(&self, width: usize, height: usize) -> Result<usize, CalcResizeError> {
+    pub fn calc_token_count(&self, width: usize, height: usize) -> Result<usize, CalcResizeError> {
         self.calc_resize(width, height)
-            .map(|result| result.num_tokens)
+            .map(|result| result.token_count)
     }
 
     /// Return whether token-budget fitting leaves `width`×`height` unchanged.
     /// This checks dimensions only; it does not inspect encoded image bytes.
+    /// Returns `false` when fitting does not converge.
     pub fn is_image_valid(&self, width: usize, height: usize) -> bool {
         self.calc_resize(width, height)
             .map(|result| result.best_width == width && result.best_height == height)
             .unwrap_or(false)
     }
 
-    /// Return the target size and token length for an image of `width`×`height`
-    /// pixels.
+    /// Return the target size and image token count for an image of
+    /// `width`×`height` pixels.
     ///
     /// # Errors
     ///
@@ -150,7 +154,9 @@ impl ImageTokenSpec {
         self.fit_token_budget(height, width, best_height, best_width)
     }
 
-    /// Reduce `best_width`×`best_height` until the token budget is satisfied.
+    /// Return the aligned size `best_width`×`best_height` if it fits the token
+    /// budget; otherwise solve once for the largest aspect-preserving size
+    /// within the budget.
     fn fit_token_budget(
         &self,
         height: usize,
@@ -159,18 +165,18 @@ impl ImageTokenSpec {
         best_width: usize,
     ) -> ResizeResult {
         let mut result = self.resize_result(best_height, best_width);
-        if result.num_tokens > self.max_n_token {
-            result = self.solve_resize_ratio(height, width, self.max_n_token);
+        if result.token_count > self.max_token_count {
+            result = self.solve_resize_ratio(height, width, self.max_token_count);
             assert!(
-                result.num_tokens <= self.max_n_token,
+                result.token_count <= self.max_token_count,
                 "token budget must be satisfied after one solve"
             );
         }
         result
     }
 
-    /// Return the token length of a patch grid of `best_height`×`best_width`
-    /// pixels.
+    /// Return the token grid and image token count of a
+    /// `best_width`×`best_height` image that is already aligned to patches.
     fn resize_result(&self, best_height: usize, best_width: usize) -> ResizeResult {
         let n_llm_h = (best_height / self.patch_size).div_ceil(self.downsample_ratio);
         let n_llm_w = (best_width / self.patch_size).div_ceil(self.downsample_ratio);
@@ -179,33 +185,39 @@ impl ImageTokenSpec {
             n_llm_w,
             best_height,
             best_width,
-            num_tokens: self.calc_num_tokens(n_llm_h, n_llm_w),
+            token_count: self.calc_grid_token_count(n_llm_h, n_llm_w),
         }
     }
 
-    /// Return the model tokens of a `n_llm_h`×`n_llm_w` token grid.
+    /// Return the image token count of a token grid with `n_llm_h` rows and
+    /// `n_llm_w` columns.
     ///
-    /// Each row holds one newline token in addition to its image tokens, and the
-    /// image is delimited by a start and an end token.
-    fn calc_num_tokens(&self, n_llm_h: usize, n_llm_w: usize) -> usize {
+    /// Each row holds one token per column and one newline token, and a start
+    /// token and an end token delimit the image.
+    fn calc_grid_token_count(&self, n_llm_h: usize, n_llm_w: usize) -> usize {
         n_llm_h * (n_llm_w + 1) + 2
     }
 
-    /// Solve for the largest aspect-preserving size within `max_n_token`.
-    fn solve_resize_ratio(&self, height: usize, width: usize, max_n_token: usize) -> ResizeResult {
+    /// Solve for the largest aspect-preserving size within `max_token_count`.
+    fn solve_resize_ratio(
+        &self,
+        height: usize,
+        width: usize,
+        max_token_count: usize,
+    ) -> ResizeResult {
         let ratio = height as f64 / width as f64;
-        let max_w_float = ((max_n_token as f64 - 2.0) / ratio + 0.25).sqrt() - 0.5;
+        let max_w_float = ((max_token_count as f64 - 2.0) / ratio + 0.25).sqrt() - 0.5;
         let max_h_float = max_w_float * ratio;
 
         let (best_height, best_width);
         if max_w_float < 1.0 {
             let max_w = 1;
-            let max_h = (max_n_token - 2) / (max_w + 1);
+            let max_h = (max_token_count - 2) / (max_w + 1);
             best_width = max_w * self.patch_size * self.downsample_ratio;
             best_height = max_h * self.patch_size * self.downsample_ratio;
         } else if max_h_float < 1.0 {
             let max_h = 1;
-            let max_w = (max_n_token - 2) / max_h - 1;
+            let max_w = (max_token_count - 2) / max_h - 1;
             assert!(max_w > 1, "token budget must allow a two-column grid");
             best_width = max_w * self.patch_size * self.downsample_ratio;
             best_height = max_h * self.patch_size * self.downsample_ratio;
@@ -227,9 +239,9 @@ impl ImageTokenSpec {
 mod tests {
     use super::*;
 
-    /// Expected target sizes and token lengths of the V4.1 preprocessing.
+    /// Expected target sizes and token counts of the V4.1 preprocessing.
     const CASES: &[(usize, usize, usize, usize, usize, usize, usize)] = &[
-        // width, height, num_tokens, best_width, best_height, n_llm_h, n_llm_w
+        // width, height, token_count, best_width, best_height, n_llm_h, n_llm_w
         (978, 479, 302, 980, 490, 12, 24),
         (272, 300, 198, 518, 574, 14, 13),
         (516, 517, 184, 546, 546, 13, 13),
@@ -271,7 +283,7 @@ mod tests {
     #[test]
     fn calc_resize_matches_v41_preprocessing() {
         let spec = ImageTokenSpec::v41();
-        for &(width, height, num_tokens, best_width, best_height, n_llm_h, n_llm_w) in CASES {
+        for &(width, height, token_count, best_width, best_height, n_llm_h, n_llm_w) in CASES {
             let result = spec.calc_resize(width, height).expect("resize converges");
             assert_eq!(
                 result,
@@ -280,12 +292,12 @@ mod tests {
                     n_llm_w,
                     best_height,
                     best_width,
-                    num_tokens,
+                    token_count,
                 },
                 "calc_resize({width}, {height})"
             );
             assert!(
-                result.num_tokens <= spec.max_n_token(),
+                result.token_count <= spec.max_token_count(),
                 "({width}, {height}) exceeds the budget"
             );
         }
@@ -303,11 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn token_len_has_a_floor_and_a_ceiling() {
+    fn token_count_has_a_floor_and_a_ceiling() {
         let spec = ImageTokenSpec::v41();
-        assert_eq!(spec.calc_token_len(1, 1).expect("resize converges"), 184);
+        assert_eq!(spec.calc_token_count(1, 1).expect("resize converges"), 184);
         assert_eq!(
-            spec.calc_token_len(16809, 11841).expect("resize converges"),
+            spec.calc_token_count(16809, 11841)
+                .expect("resize converges"),
             990
         );
     }

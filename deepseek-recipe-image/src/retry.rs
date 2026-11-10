@@ -1,4 +1,4 @@
-//! Retrying an operation that may fail.
+//! Retrying an operation that might fail.
 
 use std::future::Future;
 use std::time::Duration;

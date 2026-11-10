@@ -1,6 +1,8 @@
 //! Python representations of backend inference chunks and usage snapshots.
 
-use deepseek_recipe::stream::{InferenceChunk, InferenceFinishReason, PromptUsage};
+use deepseek_recipe::stream::{
+    InferenceChunk, InferenceFinishReason, InferenceTokenLogprob, PromptUsage,
+};
 use pyo3::prelude::*;
 
 /// Prompt-side token counts supplied by the inference backend.
@@ -70,11 +72,14 @@ impl PyInferenceFinishReason {
     }
 }
 
-/// One backend inference chunk, constructed with `ready`, `text`, `token`, or
-/// `finish`.
+/// The log probability of one token and its `(token_id, logprob)` alternatives.
+type InferenceTokenLogprobTuple = (f32, Vec<(u32, f32)>);
+
+/// One backend inference chunk, constructed with `ready`, `text`, `tokens`,
+/// or `finish`.
 ///
-/// Ready chunks carry the prompt usage snapshot; text chunks carry the tokens
-/// their content accounts for. Omitted counts default to zero.
+/// Ready chunks carry the prompt usage snapshot; text chunks carry the number
+/// of tokens their content accounts for. Omitted counts default to zero.
 #[pyclass(name = "InferenceChunk", module = "deepseek_recipe._native", frozen)]
 pub(crate) struct PyInferenceChunk {
     inner: InferenceChunk,
@@ -92,13 +97,17 @@ impl PyInferenceChunk {
             },
             InferenceChunk::Text {
                 content,
-                content_tokens,
+                token_count,
             } => InferenceChunk::Text {
                 content: content.clone(),
-                content_tokens: *content_tokens,
+                token_count: *token_count,
             },
-            InferenceChunk::Token { token_id } => InferenceChunk::Token {
-                token_id: *token_id,
+            InferenceChunk::Tokens {
+                token_ids,
+                logprobs,
+            } => InferenceChunk::Tokens {
+                token_ids: token_ids.clone(),
+                logprobs: logprobs.clone(),
             },
             InferenceChunk::Finish { finish_reason } => InferenceChunk::Finish {
                 finish_reason: *finish_reason,
@@ -112,7 +121,7 @@ impl PyInferenceChunk {
     /// Construct the backend's initial metadata chunk.
     ///
     /// Omitted usage defaults to zero. The system fingerprint is carried into
-    /// protocol responses that expose it, such as OpenAI Chat Completions.
+    /// protocol responses that expose it, such as Chat Completions.
     #[staticmethod]
     #[pyo3(signature = (*, prompt_usage = None, system_fingerprint = None))]
     fn ready(
@@ -129,24 +138,40 @@ impl PyInferenceChunk {
 
     /// Construct one text chunk from the backend.
     ///
-    /// `content_tokens` is the number of tokens this chunk's content accounts
+    /// `token_count` is the number of tokens this chunk's content accounts
     /// for; the stream processor accumulates it across chunks.
     #[staticmethod]
-    #[pyo3(signature = (text, content_tokens = 0))]
-    fn text(text: String, content_tokens: usize) -> Self {
+    #[pyo3(signature = (content, token_count = 0))]
+    fn text(content: String, token_count: usize) -> Self {
         Self {
             inner: InferenceChunk::Text {
-                content: text,
-                content_tokens,
+                content,
+                token_count,
             },
         }
     }
 
-    /// Construct one token-id chunk, decoded by the processor's tokenizer.
+    /// Construct a chunk with the token IDs of one backend output, decoded
+    /// together by the processor's tokenizer.
+    ///
+    /// `logprobs`, when given, holds one `(logprob, top_logprobs)` pair per
+    /// token ID, where `top_logprobs` lists `(token_id, logprob)` alternatives.
     #[staticmethod]
-    fn token(token_id: u32) -> Self {
+    #[pyo3(signature = (token_ids, logprobs = None))]
+    fn tokens(token_ids: Vec<u32>, logprobs: Option<Vec<InferenceTokenLogprobTuple>>) -> Self {
         Self {
-            inner: InferenceChunk::Token { token_id },
+            inner: InferenceChunk::Tokens {
+                token_ids,
+                logprobs: logprobs.map(|logprobs| {
+                    logprobs
+                        .into_iter()
+                        .map(|(logprob, top_logprobs)| InferenceTokenLogprob {
+                            logprob,
+                            top_logprobs,
+                        })
+                        .collect()
+                }),
+            },
         }
     }
 
@@ -160,13 +185,13 @@ impl PyInferenceChunk {
         }
     }
 
-    /// The chunk kind: `ready`, `text`, `token`, or `finish`.
+    /// The chunk kind: `ready`, `text`, `tokens`, or `finish`.
     #[getter]
     fn kind(&self) -> &'static str {
         match &self.inner {
             InferenceChunk::Ready { .. } => "ready",
             InferenceChunk::Text { .. } => "text",
-            InferenceChunk::Token { .. } => "token",
+            InferenceChunk::Tokens { .. } => "tokens",
             InferenceChunk::Finish { .. } => "finish",
         }
     }
@@ -177,16 +202,16 @@ impl PyInferenceChunk {
         match &self.inner {
             InferenceChunk::Text { content, .. } => Some(content),
             InferenceChunk::Ready { .. }
-            | InferenceChunk::Token { .. }
+            | InferenceChunk::Tokens { .. }
             | InferenceChunk::Finish { .. } => None,
         }
     }
 
-    /// The backend token id, present only on token chunks.
+    /// The token IDs of a `tokens` chunk.
     #[getter]
-    fn token_id(&self) -> Option<u32> {
+    fn token_ids(&self) -> Option<Vec<u32>> {
         match &self.inner {
-            InferenceChunk::Token { token_id } => Some(*token_id),
+            InferenceChunk::Tokens { token_ids, .. } => Some(token_ids.clone()),
             InferenceChunk::Ready { .. }
             | InferenceChunk::Text { .. }
             | InferenceChunk::Finish { .. } => None,
@@ -202,7 +227,7 @@ impl PyInferenceChunk {
             }
             InferenceChunk::Ready { .. }
             | InferenceChunk::Text { .. }
-            | InferenceChunk::Token { .. } => None,
+            | InferenceChunk::Tokens { .. } => None,
         }
     }
 
@@ -214,19 +239,19 @@ impl PyInferenceChunk {
                 inner: *prompt_usage,
             }),
             InferenceChunk::Text { .. }
-            | InferenceChunk::Token { .. }
+            | InferenceChunk::Tokens { .. }
             | InferenceChunk::Finish { .. } => None,
         }
     }
 
-    /// The tokens this chunk's content accounts for, present only on text
-    /// chunks.
+    /// The number of tokens this chunk's content accounts for, present only
+    /// on text chunks.
     #[getter]
-    fn content_tokens(&self) -> Option<usize> {
+    fn token_count(&self) -> Option<usize> {
         match &self.inner {
-            InferenceChunk::Text { content_tokens, .. } => Some(*content_tokens),
+            InferenceChunk::Text { token_count, .. } => Some(*token_count),
             InferenceChunk::Ready { .. }
-            | InferenceChunk::Token { .. }
+            | InferenceChunk::Tokens { .. }
             | InferenceChunk::Finish { .. } => None,
         }
     }
@@ -239,7 +264,7 @@ impl PyInferenceChunk {
                 system_fingerprint, ..
             } => system_fingerprint.as_deref(),
             InferenceChunk::Text { .. }
-            | InferenceChunk::Token { .. }
+            | InferenceChunk::Tokens { .. }
             | InferenceChunk::Finish { .. } => None,
         }
     }

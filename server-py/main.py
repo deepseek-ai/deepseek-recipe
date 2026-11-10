@@ -7,8 +7,6 @@ from uuid import uuid4
 
 from anyio import CancelScope
 from deepseek_recipe import (
-    THINKING_END_TOKEN,
-    THINKING_START_TOKEN,
     CalcResizeError,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -26,10 +24,12 @@ from deepseek_recipe import (
     InferenceOptions,
     MessagesRequest,
     MessagesResponse,
+    ModelVersion,
     OpenCvImagePreprocessor,
     ReqwestImageFetcher,
     ResponsesRequest,
     ResponsesResponse,
+    SpecialToken,
     StreamProcessor,
 )
 from fastapi import FastAPI, Request
@@ -43,6 +43,26 @@ PROTOCOL_TYPES = {
     "messages": (MessagesRequest, MessagesResponse),
 }
 
+def conversion_options() -> ConversionOptions:
+    """Return the example server's conversion options.
+
+    They are the library defaults, which accept the model names
+    `DeepSeek-V4-Pro` and `DeepSeek-V4.1-Flash`, plus the DeepSeek API model
+    names `deepseek-v4-pro` and `deepseek-flash`.
+    """
+    return (
+        ConversionOptions()
+        .with_model_alias("deepseek-v4-pro", ModelVersion.DeepseekV4Pro)
+        .with_model_alias("deepseek-flash", ModelVersion.DeepseekV41Flash)
+    )
+
+
+# The prompt encoding for each `ConversationRequest.model_version` value.
+PROMPT_ENCODINGS = {
+    ModelVersion.DeepseekV4Pro: DeepseekV4Encoding,
+    ModelVersion.DeepseekV41Flash: DeepseekV41Encoding,
+}
+
 
 @dataclass(frozen=True)
 class PreparedRequest:
@@ -53,12 +73,7 @@ class PreparedRequest:
     prompt: str
     images: list[ImageInfo]
     image_token_adjustment: int
-    include_usage: bool = False
-    custom_tool_names: frozenset[str] = frozenset()
-
-    @property
-    def model(self) -> str | None:
-        return self.conversation_request.model
+    model: str
 
     @property
     def stream(self) -> bool:
@@ -84,27 +99,27 @@ def prepare_request(
     protocol: str,
     body: bytes,
     *,
-    model_version: str = "v4.1",
     options: ConversionOptions | None = None,
 ) -> PreparedRequest:
     """Convert a protocol request, render its prompt, and resolve its images.
 
-    `options` configures Rust conversion defaults, including the web-search
-    behavior of the Responses and Messages protocols. It defaults to
-    `ConversionOptions()`, which ignores Responses `web_search` declarations and
-    rejects Messages `web_search` declarations.
+    `options` configures Rust conversion, including the web-search behavior of
+    the Responses and Messages protocols and the accepted model names. It
+    defaults to `conversion_options()`, which drops Responses `web_search`
+    declarations, rejects Messages `web_search` declarations, and accepts the
+    DeepSeek API model names. Conversion resolves the target model version from
+    the request's model name, and that version selects the prompt encoding.
     """
     request_type, _ = PROTOCOL_TYPES[protocol]
     try:
         request = request_type(body)
     except ValueError as error:
         raise RequestError(str(error)) from error
-    include_usage = request.include_usage() if protocol == "chat_completions" else False
-    custom_tool_names = (
-        frozenset(request.custom_tool_names()) if protocol == "responses" else frozenset()
-    )
-    converted = request.convert(options if options is not None else ConversionOptions())
-    encoding_type = {"v4": DeepseekV4Encoding, "v4.1": DeepseekV41Encoding}[model_version]
+    model = request.model
+    if options is None:
+        options = conversion_options()
+    converted = request.convert(options)
+    encoding_type = PROMPT_ENCODINGS[converted.model_version]
     rendered = encoding_type().render_conversation(converted.conversation)
     images = []
     image_token_adjustment = 0
@@ -126,8 +141,7 @@ def prepare_request(
         rendered.prompt,
         images,
         image_token_adjustment,
-        include_usage,
-        custom_tool_names,
+        model,
     )
 
 
@@ -145,10 +159,10 @@ class InferenceStreamingResponse(StreamingResponse):
 async def mock_inference(request: PreparedRequest) -> AsyncIterator[InferenceChunk]:
     """Produce a fixed answer for the example server."""
     yield InferenceChunk.ready()
-    if request.prompt.endswith(THINKING_START_TOKEN):
-        yield InferenceChunk.text(THINKING_END_TOKEN, content_tokens=1)
-    yield InferenceChunk.text("Hello ", content_tokens=1)
-    yield InferenceChunk.text("world!", content_tokens=1)
+    if request.prompt.endswith(SpecialToken.ThinkingStart.default_str()):
+        yield InferenceChunk.text(SpecialToken.ThinkingEnd.default_str(), token_count=1)
+    yield InferenceChunk.text("Hello ", token_count=1)
+    yield InferenceChunk.text("world!", token_count=1)
     yield InferenceChunk.finish(finish_reason=InferenceFinishReason.Stop)
 
 
@@ -159,10 +173,6 @@ async def response_body(
     response_id = str(uuid4())
     model = request.model or "deepseek-flash"
     generator = request_type.chunk_generator(request.conversation_request, response_id, model)
-    if request.protocol == "chat_completions":
-        generator = generator.with_include_usage(request.include_usage)
-    elif request.protocol == "responses":
-        generator = generator.with_custom_tool_names(request.custom_tool_names)
     processor = StreamProcessor(generator, request.conversation_request.parsing_options)
     response = None if request.stream else response_type(response_id, model, int(time()), 0, 0)
     inference = None
@@ -177,13 +187,13 @@ async def response_body(
                 chunks = processor.push(chunk)
             for output in chunks:
                 if request.stream:
-                    yield sse_frame(response_type.chunk_event_type(output), output.to_json())
+                    yield sse_frame(response_type.sse_event_name(output), output.to_json())
                 else:
-                    response.append(output)
+                    response.accumulate(output)
             if processor.finished:
                 break
         if request.stream:
-            done = response_type.done_message()
+            done = response_type.sse_done_data()
             if done is not None:
                 yield sse_frame(None, done)
         else:
@@ -209,8 +219,10 @@ def create_app(
 ) -> FastAPI:
     """Create a server using an asynchronous inference iterator.
 
-    `options` is passed to every request conversion. It defaults to
-    `ConversionOptions()`, which keeps the Rust conversion defaults.
+    `options` is passed to every request conversion. Conversion resolves the
+    model version from the request's model name through its
+    `model_versions_by_name`, and that version selects the prompt encoding. It
+    defaults to `conversion_options()`.
 
     The backend owns cancellation protection for asynchronous cleanup inside
     its own iterator. The server protects the explicit aclose() call.

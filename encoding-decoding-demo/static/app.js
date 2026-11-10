@@ -24,6 +24,7 @@ const SAMPLES = {
         tool_calls: [
           {
             id: "call_1",
+            type: "function",
             function: {
               name: "get_weather",
               arguments: JSON.stringify({ location: "Beijing", days: 3 }),
@@ -79,7 +80,7 @@ const SAMPLES = {
 };
 
 const DEFAULT_FORMAT = "chat_completions";
-const EOT = "<｜end▁of▁sentence｜>";
+const EOS = "<｜end▁of▁sentence｜>";
 const OUTPUT_SAMPLE = `<think>The user wants to compare the weather in Beijing and Shanghai for the next three days, so I need forecasts for both cities.
 </think>
 I'll check the weather in Beijing and Shanghai for the next three days.
@@ -93,7 +94,7 @@ I'll check the weather in Beijing and Shanghai for the next three days.
 <｜DSML｜ parameter name="location" string="true">Shanghai</｜DSML｜ parameter>
 <｜DSML｜ parameter name="days" string="false">3</｜DSML｜ parameter>
 </｜DSML｜ invoke>
-</｜DSML｜ calls>${EOT}`;
+</｜DSML｜ calls>${EOS}`;
 
 const tabs = Array.from(document.querySelectorAll(".tab"));
 const modeTabs = Array.from(document.querySelectorAll(".mode-tab"));
@@ -104,12 +105,12 @@ const errorBox = document.getElementById("error");
 const tip = document.getElementById("tip");
 const modelOutput = document.getElementById("model-output");
 const modelOutputPreview = document.getElementById("model-output-preview");
-const decodedOutput = document.getElementById("decoded-output");
-const decodeMeta = document.getElementById("decode-meta");
-const decodeError = document.getElementById("decode-error");
+const parsedOutput = document.getElementById("parsed-output");
+const parseMeta = document.getElementById("parse-meta");
+const parseError = document.getElementById("parse-error");
 const responseFormat = document.getElementById("response-format");
 
-const state = { mode: "encode", format: DEFAULT_FORMAT, drafts: { ...SAMPLES }, renderId: 0, decodeId: 0 };
+const state = { mode: "render", format: DEFAULT_FORMAT, drafts: { ...SAMPLES }, renderId: 0, parseId: 0 };
 
 function pretty(value) {
   return JSON.stringify(value, null, 2);
@@ -121,7 +122,7 @@ function pick(value, keys) {
 
 // Select protocol fields explicitly: tool inputs and argument strings are
 // payloads, so metadata-like keys inside them must remain untouched.
-function decodedContent(format, response) {
+function parsedContent(format, response) {
   switch (format) {
     case "chat_completions":
       return {
@@ -157,8 +158,8 @@ function decodedContent(format, response) {
 }
 
 function runMode() {
-  if (state.mode === "encode") renderPrompt();
-  else decodeOutput();
+  if (state.mode === "render") renderPrompt();
+  else parseOutput();
 }
 
 function setMode(mode) {
@@ -169,7 +170,7 @@ function setMode(mode) {
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
   }
-  for (const name of ["encode", "decode"]) {
+  for (const name of ["render", "parse"]) {
     document.getElementById(`${name}-panel`).hidden = name !== mode;
     document.getElementById(`${name}-actions`).hidden = name !== mode;
   }
@@ -189,9 +190,9 @@ function setFormat(format) {
   }
   input.value = state.drafts[format];
   state.renderId++;
-  state.decodeId++;
+  state.parseId++;
   clearPrompt();
-  clearDecoded();
+  clearParsed();
   hideError();
   runMode();
 }
@@ -243,30 +244,30 @@ async function post(url, body) {
   return payload;
 }
 
-async function decodeOutput() {
-  const id = ++state.decodeId;
+async function parseOutput() {
+  const id = ++state.parseId;
   const format = state.format;
-  clearDecoded();
-  decodeMeta.textContent = "Decoding…";
-  decodedOutput.setAttribute("aria-busy", "true");
+  clearParsed();
+  parseMeta.textContent = "Parsing…";
+  parsedOutput.setAttribute("aria-busy", "true");
   try {
     const body = requestBody();
-    const payload = await post("/api/decode", {
+    const payload = await post("/api/parse", {
       format,
       body,
       output: modelOutput.value,
     });
-    if (id !== state.decodeId) return;
+    if (id !== state.parseId) return;
     renderModelOutput(payload.segments);
-    decodedOutput.textContent = pretty(decodedContent(format, payload.response));
-    decodeMeta.textContent = "";
+    parsedOutput.textContent = pretty(parsedContent(format, payload.response));
+    parseMeta.textContent = "";
   } catch (err) {
-    if (id !== state.decodeId) return;
-    clearDecoded();
-    decodeError.textContent = err.message;
-    decodeError.hidden = false;
+    if (id !== state.parseId) return;
+    clearParsed();
+    parseError.textContent = err.message;
+    parseError.hidden = false;
   } finally {
-    if (id === state.decodeId) decodedOutput.setAttribute("aria-busy", "false");
+    if (id === state.parseId) parsedOutput.setAttribute("aria-busy", "false");
   }
 }
 
@@ -277,17 +278,17 @@ function clearPrompt() {
   tip.hidden = true;
 }
 
-function clearDecoded() {
-  decodedOutput.textContent = "";
-  decodedOutput.setAttribute("aria-busy", "false");
-  decodeMeta.textContent = "";
-  decodeError.hidden = true;
+function clearParsed() {
+  parsedOutput.textContent = "";
+  parsedOutput.setAttribute("aria-busy", "false");
+  parseMeta.textContent = "";
+  parseError.hidden = true;
 }
 
-function invalidateDecoded() {
-  state.decodeId++;
-  clearDecoded();
-  decodeMeta.textContent = "Input changed, ready to decode";
+function invalidateParsed() {
+  state.parseId++;
+  clearParsed();
+  parseMeta.textContent = "Output changed; parse again";
 }
 
 function render(payload) {
@@ -296,7 +297,7 @@ function render(payload) {
     fragment.append(renderSegment(segment));
   }
   output.replaceChildren(fragment);
-  meta.textContent = `${payload.prompt.length} chars`;
+  meta.textContent = `${payload.prompt.length} characters`;
 }
 
 function syncModelOutputScroll() {
@@ -396,20 +397,20 @@ output.addEventListener("mouseout", (event) => {
 });
 
 document.getElementById("render-prompt").addEventListener("click", renderPrompt);
-document.getElementById("decode-output").addEventListener("click", decodeOutput);
+document.getElementById("parse-output").addEventListener("click", parseOutput);
 
 input.addEventListener("input", () => {
   state.drafts[state.format] = input.value;
   state.renderId++;
   clearPrompt();
   hideError();
-  meta.textContent = "Request changed, ready to render";
-  invalidateDecoded();
+  meta.textContent = "Request changed; render again";
+  invalidateParsed();
 });
 
 modelOutput.addEventListener("input", () => {
   renderModelOutput();
-  invalidateDecoded();
+  invalidateParsed();
 });
 modelOutput.addEventListener("scroll", syncModelOutputScroll);
 new ResizeObserver(syncModelOutputScroll).observe(modelOutput);
@@ -417,7 +418,7 @@ new ResizeObserver(syncModelOutputScroll).observe(modelOutput);
 modelOutput.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     event.preventDefault();
-    decodeOutput();
+    parseOutput();
   }
 });
 

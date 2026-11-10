@@ -1,6 +1,6 @@
 //! Python bindings for Rust response generators, accumulation, and streams.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,12 +13,12 @@ use deepseek_recipe::openai::chat_completion::response::{
     ChatCompletionChunk, ChatCompletionChunkGenerator, ChatCompletionResponse,
 };
 use deepseek_recipe::openai::responses::response::{
-    ResponsesChunkGenerator, ResponsesResponse, ResponsesStreamEvent,
+    ResponsesChunkGenerator, ResponsesEcho, ResponsesResponse, ResponsesStreamEvent,
 };
+use deepseek_recipe::response::Accumulate;
 use deepseek_recipe::response::ProtocolResponse;
-use deepseek_recipe::stream::state_machine::ParsingOptions;
+use deepseek_recipe::stream::ParsingOptions;
 use deepseek_recipe::stream::{ChunkGenerator, InferenceChunk, StreamError, StreamProcessor};
-use deepseek_recipe::util::append_delta::AppendDelta;
 use futures::Stream;
 use futures::channel::mpsc;
 use futures::executor::block_on;
@@ -47,23 +47,64 @@ impl PyChatCompletionChunkGenerator {
     }
 }
 
+/// Request settings that Responses response objects report, as the request
+/// specified them.
+///
+/// `ResponsesRequest.echo` reads them from a request; the constructor builds
+/// the settings of an unspecified request. The getters expose the scalar
+/// settings; the reasoning, text, tool choice, and tool settings are reported
+/// only through the response.
+#[pyclass(name = "ResponsesEcho", module = "deepseek_recipe._native", frozen)]
+pub(crate) struct PyResponsesEcho {
+    pub(crate) inner: ResponsesEcho,
+}
+
 #[pymethods]
-impl PyChatCompletionChunkGenerator {
+impl PyResponsesEcho {
+    /// Construct the settings of an unspecified request: no instructions,
+    /// output token limit, or user, temperature and `top_p` of 1.0, and zero
+    /// `top_logprobs`.
     #[new]
-    fn new(id: String, model: String, include_usage: bool, thinking_mode: bool) -> Self {
-        Self::from_core(ChatCompletionChunkGenerator::new(
-            id,
-            model,
-            include_usage,
-            thinking_mode,
-        ))
+    fn new() -> Self {
+        Self {
+            inner: ResponsesEcho::default(),
+        }
     }
 
-    /// Consume this generator and apply the Rust usage setting.
-    fn with_include_usage(&mut self, include_usage: bool) -> PyResult<Self> {
-        Ok(Self::from_core(
-            take_generator(&mut self.inner)?.with_include_usage(include_usage),
-        ))
+    /// The requested `instructions`.
+    #[getter]
+    fn instructions(&self) -> Option<&str> {
+        self.inner.instructions.as_deref()
+    }
+
+    /// The requested `max_output_tokens`.
+    #[getter]
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.inner.max_output_tokens
+    }
+
+    /// The requested temperature or 1.0, not the sampling temperature.
+    #[getter]
+    fn temperature(&self) -> f32 {
+        self.inner.temperature
+    }
+
+    /// The requested `top_p` or 1.0, not the sampling `top_p`.
+    #[getter]
+    fn top_p(&self) -> f32 {
+        self.inner.top_p
+    }
+
+    /// The requested `top_logprobs`, or 0.
+    #[getter]
+    fn top_logprobs(&self) -> u8 {
+        self.inner.top_logprobs
+    }
+
+    /// The requested `user`.
+    #[getter]
+    fn user(&self) -> Option<&str> {
+        self.inner.user.as_deref()
     }
 }
 
@@ -81,15 +122,20 @@ impl PyResponsesChunkGenerator {
 
 #[pymethods]
 impl PyResponsesChunkGenerator {
-    #[new]
-    fn new(id: String, model: String) -> Self {
-        Self::from_core(ResponsesChunkGenerator::new(id, model))
+    /// Consume this generator and configure the namespace tool names.
+    fn with_namespace_tool_map(
+        &mut self,
+        namespace_tool_map: HashMap<String, (String, String)>,
+    ) -> PyResult<Self> {
+        Ok(Self::from_core(
+            take_generator(&mut self.inner)?.with_namespace_tool_map(namespace_tool_map),
+        ))
     }
 
-    /// Consume this generator and configure the custom tool names.
-    fn with_custom_tool_names(&mut self, custom_tool_names: HashSet<String>) -> PyResult<Self> {
+    /// Consume this generator and configure the reported request settings.
+    fn with_echo(&mut self, echo: &PyResponsesEcho) -> PyResult<Self> {
         Ok(Self::from_core(
-            take_generator(&mut self.inner)?.with_custom_tool_names(custom_tool_names),
+            take_generator(&mut self.inner)?.with_echo(echo.inner.clone()),
         ))
     }
 }
@@ -113,7 +159,8 @@ impl PyMessagesChunkGenerator {
         Self::from_core(MessagesChunkGenerator::new(id, model, thinking_mode))
     }
 
-    /// Consume this generator and apply the Rust thinking signature setting.
+    /// Consume this generator and return one that emits `signature` at the end
+    /// of each thinking block. The default signature is the response ID.
     fn with_signature(&mut self, signature: String) -> PyResult<Self> {
         Ok(Self::from_core(
             take_generator(&mut self.inner)?.with_signature(signature),
@@ -187,13 +234,14 @@ macro_rules! response_bindings {
                 }
             }
 
-            /// Consume a chunk and delegate to Rust `AppendDelta::append`.
-            fn append(&mut self, chunk: &mut $py_chunk) -> PyResult<()> {
+            /// Apply `chunk` to this response. `chunk` cannot be used afterward;
+            /// a consumed chunk raises `RuntimeError`.
+            fn accumulate(&mut self, chunk: &mut $py_chunk) -> PyResult<()> {
                 let chunk = chunk
                     .inner
                     .take()
                     .ok_or_else(|| PyRuntimeError::new_err("protocol chunk has been consumed"))?;
-                self.inner.append(chunk);
+                self.inner.accumulate(chunk);
                 Ok(())
             }
 
@@ -202,16 +250,18 @@ macro_rules! response_bindings {
                 to_json(&self.inner)
             }
 
-            /// Return the event name supplied by the Rust protocol response.
+            /// Return the SSE event name of `chunk`, or `None` for an unnamed
+            /// data event.
             #[staticmethod]
-            fn chunk_event_type(chunk: &$py_chunk) -> PyResult<Option<&'static str>> {
-                Ok($response::chunk_event_type(chunk.as_core()?))
+            fn sse_event_name(chunk: &$py_chunk) -> PyResult<Option<&'static str>> {
+                Ok($response::sse_event_name(chunk.as_core()?))
             }
 
-            /// Return the transport sentinel supplied by the Rust response.
+            /// Return the data of the final SSE message, such as `[DONE]`, when
+            /// the protocol ends its stream with one.
             #[staticmethod]
-            fn done_message() -> Option<String> {
-                $response::done_message()
+            fn sse_done_data() -> Option<String> {
+                $response::sse_done_data()
             }
         }
     };
@@ -244,7 +294,8 @@ response_bindings!(
 
 enum ProtocolChunk {
     ChatCompletion(ChatCompletionChunk),
-    Responses(ResponsesStreamEvent),
+    /// Boxed because response events carry the complete response object.
+    Responses(Box<ResponsesStreamEvent>),
     Messages(MessagesStreamEvent),
 }
 
@@ -254,9 +305,13 @@ impl ProtocolChunk {
             Self::ChatCompletion(chunk) => {
                 Ok(Py::new(py, PyChatCompletionChunk { inner: Some(chunk) })?.into_any())
             }
-            Self::Responses(chunk) => {
-                Ok(Py::new(py, PyResponsesStreamEvent { inner: Some(chunk) })?.into_any())
-            }
+            Self::Responses(chunk) => Ok(Py::new(
+                py,
+                PyResponsesStreamEvent {
+                    inner: Some(*chunk),
+                },
+            )?
+            .into_any()),
             Self::Messages(chunk) => {
                 Ok(Py::new(py, PyMessagesStreamEvent { inner: Some(chunk) })?.into_any())
             }
@@ -276,9 +331,10 @@ struct Processor {
 
 /// Adapt Python input to the Rust processor's inference stream.
 ///
-/// Construction consumes the generator. Each push produces the protocol chunks
-/// available before the processor needs another input. Finish closes the input
-/// normally; close releases state without generating successful completion.
+/// Construction consumes the generator. Each `push` produces the protocol
+/// chunks available before the processor needs another input. `finish` closes
+/// the input normally; `close` releases state without generating successful
+/// completion.
 #[pyclass(name = "StreamProcessor", module = "deepseek_recipe._native", frozen)]
 pub(crate) struct PyStreamProcessor {
     state: Mutex<Processor>,
@@ -310,8 +366,9 @@ impl PyStreamProcessor {
             Some(tokenizer) => processor.with_tokenizer(tokenizer),
             None => processor,
         };
-        let events =
-            futures::StreamExt::map(processor.process(input), move |event| event.map(wrap));
+        let events = futures::StreamExt::map(processor.into_protocol_stream(input), move |event| {
+            event.map(wrap)
+        });
         Self {
             state: Mutex::new(Processor {
                 input: Some(sender),
@@ -364,7 +421,7 @@ impl PyStreamProcessor {
                 take_generator(&mut generator.inner)?,
                 options.inner.clone(),
                 tokenizer,
-                ProtocolChunk::Responses,
+                |chunk| ProtocolChunk::Responses(Box::new(chunk)),
             ))
         } else if let Ok(mut generator) =
             generator.extract::<PyRefMut<'_, PyMessagesChunkGenerator>>()
@@ -381,7 +438,10 @@ impl PyStreamProcessor {
     }
 
     /// Process one inference chunk until Rust needs another input.
-    /// Raises `RuntimeError` after completion or close, or on a decoding failure.
+    /// Raises `RuntimeError` after completion or close, or on a stream error: a
+    /// `tokens` chunk without a tokenizer, a decoding failure, or a log
+    /// probability count that differs from the token ID count. A stream error
+    /// closes the processor.
     fn push(&self, py: Python<'_>, chunk: &PyInferenceChunk) -> PyResult<Vec<Py<PyAny>>> {
         let chunk = chunk.to_core();
         self.with_state(py, |state| state.push(chunk))?
@@ -392,7 +452,7 @@ impl PyStreamProcessor {
 
     /// Close the input normally and process its buffered output.
     /// Repeated calls after completion produce no chunks. Calls after close or
-    /// a decoding failure raise `RuntimeError`.
+    /// a stream error raise `RuntimeError`.
     fn finish(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.with_state(py, Processor::finish)?
             .into_iter()

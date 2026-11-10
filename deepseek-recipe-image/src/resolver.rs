@@ -1,5 +1,7 @@
 //! Resolve image sources into the images of one request.
 
+use std::collections::HashMap;
+
 use futures::StreamExt;
 use futures::stream::{self, TryStreamExt};
 
@@ -10,11 +12,12 @@ use crate::limits::{ImageByteBudget, ImageLimits, ImageQuota};
 use crate::retry::RetryPolicy;
 use crate::{ImageFetcher, ImagePreprocessor};
 
-/// Resolves image sources into preprocessed images.
+/// A resolver that turns image sources into preprocessed images.
 ///
-/// Supports external URLs, data URLs, and encoded bytes. Applies request limits
-/// and preserves source order. The caller supplies the fetcher and preprocessor.
-/// At most [`ImageLimits::max_concurrent_sources`] sources are resolved and
+/// The resolver accepts external URLs, data URLs, and caller-supplied encoded
+/// bytes. It applies [`ImageLimits`] and keeps the images in source order. The
+/// caller supplies the fetcher and the preprocessor. At most
+/// [`ImageLimits::max_concurrent_sources`] sources are resolved and
 /// preprocessed concurrently.
 pub struct ImageResolver<F, P> {
     fetcher: F,
@@ -64,6 +67,15 @@ where
     /// preprocessed, or when the request exceeds a limit. A failed call leaves
     /// `quota` unchanged: the sources of the call are recorded once every one of
     /// them is preprocessed.
+    ///
+    /// Every returned error carries the request location of the image it
+    /// reports, from [`ImageSource::path`]. An error of one image also carries
+    /// the image's index among the sources of this call that share its path,
+    /// so the sources of one message or block are numbered from zero.
+    /// [`ImageError::TooManyImages`] names the path of the first source beyond
+    /// [`ImageLimits::max_images`] and counts the sources through the last one
+    /// that shares that path. [`ImageError::TotalSizeTooLarge`] names the path
+    /// of the source whose bytes exceed [`ImageLimits::max_total_bytes`].
     pub async fn resolve(
         &self,
         sources: &[ImageSource],
@@ -71,11 +83,22 @@ where
     ) -> Result<MultiModalData, ImageError> {
         let request_image_count = quota.image_count() + sources.len();
         if request_image_count > self.limits.max_images {
+            // The first source beyond the limit names the error; the count
+            // includes the rest of the sources that share its path.
+            let first_beyond = self.limits.max_images.saturating_sub(quota.image_count());
+            let path = sources.get(first_beyond).map_or("", ImageSource::path);
+            let group_end = sources
+                .iter()
+                .skip(first_beyond)
+                .position(|source| source.path() != path)
+                .map_or(sources.len(), |offset| first_beyond + offset);
             return Err(ImageError::TooManyImages {
+                path: path.to_string(),
                 max: self.limits.max_images,
-                count: request_image_count,
+                count: quota.image_count() + group_end,
             });
         }
+        let indices = image_indices(sources);
 
         // The bytes of earlier calls of this request are recorded in `quota`
         // rather than reserved again in this budget.
@@ -87,31 +110,38 @@ where
         let concurrency = self.limits.max_concurrent_sources.max(1);
         // The futures are created before they are polled, so the sources are
         // resolved at most `concurrency` at a time.
+        let budget = &budget;
         let resolutions: Vec<_> = sources
             .iter()
-            .map(|source| self.encoded_bytes(source, &budget))
+            .zip(&indices)
+            .map(|(source, &index)| async move {
+                self.load_encoded_bytes(source, budget)
+                    .await
+                    .map_err(|error| error.with_location(source.path(), index))
+            })
             .collect();
         let encoded: Vec<Vec<u8>> = stream::iter(resolutions)
             .buffered(concurrency)
             .try_collect()
             .await?;
 
-        // A fetch reserves the bytes it keeps while it reads a body. This check
-        // rejects an implementation that returns more than it reserved.
+        // A fetcher might return bytes it did not reserve from `budget`, so this
+        // loop applies the per-image and total limits to the returned lengths.
         let mut request_bytes = quota.byte_size();
-        for data in &encoded {
+        for ((data, source), &index) in encoded.iter().zip(sources).zip(&indices) {
             if data.len() > self.limits.max_image_bytes {
-                return Err(ImageError::ImageTooLarge {
-                    size: data.len(),
-                    max: self.limits.max_image_bytes,
-                });
+                return Err(
+                    ImageError::image_too_large(data.len(), self.limits.max_image_bytes)
+                        .with_location(source.path(), index),
+                );
             }
             request_bytes += data.len();
             if request_bytes > self.limits.max_total_bytes {
-                return Err(ImageError::TotalSizeTooLarge {
-                    size: request_bytes,
-                    max: self.limits.max_total_bytes,
-                });
+                return Err(ImageError::total_size_too_large(
+                    request_bytes,
+                    self.limits.max_total_bytes,
+                )
+                .with_location(source.path(), index));
             }
         }
         let admitted_bytes = request_bytes - quota.byte_size();
@@ -119,11 +149,15 @@ where
         let preprocesses: Vec<_> = encoded
             .into_iter()
             .zip(sources)
-            .map(|(data, source)| {
+            .zip(&indices)
+            .map(|((data, source), &index)| async move {
                 let options = self
                     .limits
                     .preprocess_options(source.detail(), request_image_count);
-                self.preprocessor.preprocess(data, options)
+                self.preprocessor
+                    .preprocess(data, options)
+                    .await
+                    .map_err(|error| error.with_location(source.path(), index))
             })
             .collect();
         let images = stream::iter(preprocesses)
@@ -136,8 +170,11 @@ where
         Ok(MultiModalData { images })
     }
 
-    /// Return the encoded bytes of one image source.
-    async fn encoded_bytes(
+    /// Load the encoded image bytes of one source: fetch an external URL with
+    /// retries, decode a data URL, or copy caller-supplied bytes, reserving
+    /// the bytes from `budget`. The returned error carries no request
+    /// location.
+    async fn load_encoded_bytes(
         &self,
         source: &ImageSource,
         budget: &ImageByteBudget,
@@ -145,13 +182,18 @@ where
         let data = match source {
             ImageSource::DataUrl { data_url, .. } => decode_data_url(data_url, budget)?,
             ImageSource::Url { url, .. } => {
-                // Direct sources receive the same HTTP prefix check as
-                // protocol input. The fetcher validates the full URL.
+                // Sources the caller constructs without protocol conversion
+                // receive the same HTTP prefix check as protocol input. The
+                // fetcher validates the full URL.
                 if !is_http_url(url) {
-                    return Err(ImageError::InvalidUrl { url: url.clone() });
+                    return Err(ImageError::InvalidUrl {
+                        path: String::new(),
+                        url: url.clone(),
+                    });
                 }
                 if url.len() > self.limits.max_url_len {
                     return Err(ImageError::UrlTooLong {
+                        path: String::new(),
                         len: url.len(),
                         max: self.limits.max_url_len,
                     });
@@ -163,14 +205,11 @@ where
                     )
                     .await
                     .map_err(|error| match error {
-                        // The fetcher already reports the rejected URL.
-                        error @ (ImageError::Fetch { .. } | ImageError::FetchStatus { .. }) => {
-                            error
-                        }
-                        error => ImageError::Fetch {
-                            url: url.clone(),
-                            source: Box::new(error),
-                        },
+                        // These errors already carry the URL.
+                        error @ (ImageError::Fetch { .. }
+                        | ImageError::FetchStatus { .. }
+                        | ImageError::DestinationRejected { .. }) => error,
+                        error => ImageError::fetch(url, error),
                     })?
             }
             ImageSource::Bytes { data, .. } => {
@@ -179,51 +218,73 @@ where
             }
         };
         if data.is_empty() {
-            return Err(ImageError::EmptyImage);
+            return Err(ImageError::empty_image());
         }
         Ok(data)
     }
+}
+
+/// Return, for each source, the number of earlier sources with the same path:
+/// the index that error messages report for the image.
+fn image_indices(sources: &[ImageSource]) -> Vec<usize> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    sources
+        .iter()
+        .map(|source| {
+            let count = seen.entry(source.path()).or_insert(0);
+            let index = *count;
+            *count += 1;
+            index
+        })
+        .collect()
 }
 
 /// Reserve the bytes of one image that is already in memory.
 fn reserve_image_bytes(budget: &ImageByteBudget, bytes: usize) -> Result<(), ImageError> {
     let max = budget.max_image_bytes();
     if bytes > max {
-        return Err(ImageError::ImageTooLarge { size: bytes, max });
+        return Err(ImageError::image_too_large(bytes, max));
     }
     budget.reserve(bytes)
 }
 
-/// Decode a base64 or percent-encoded data URL with a supported image media type.
+/// Decode a base64 or percent-encoded data URL with a supported image media
+/// type, reserving the decoded bytes from `budget`.
 fn decode_data_url(data_url: &str, budget: &ImageByteBudget) -> Result<Vec<u8>, ImageError> {
-    let parsed = data_url::DataUrl::process(data_url)
-        .map_err(|err| ImageError::InvalidDataUrl(err.to_string()))?;
+    let parsed = data_url::DataUrl::process(data_url).map_err(ImageError::invalid_data_url)?;
     let media_type = parsed.mime_type().to_string();
     if ImageMediaType::from_mime(&media_type).is_none() {
-        return Err(ImageError::UnsupportedMediaType(media_type));
+        return Err(ImageError::unsupported_media_type(media_type));
     }
-    // A data URL carries the image in the request itself, so the decoded size is
-    // checked before the body is decoded and again once it is known.
+    // A data URL carries the image in the request itself, so the estimated
+    // decoded length is checked before decoding, and the decoded length is
+    // checked and reserved once it is known.
     let estimated = estimated_decoded_len(data_url);
     let max_image_bytes = budget.max_image_bytes();
     if estimated > max_image_bytes {
-        return Err(ImageError::ImageTooLarge {
-            size: estimated,
-            max: max_image_bytes,
-        });
+        return Err(ImageError::image_too_large(estimated, max_image_bytes));
     }
     let (data, _) = parsed
         .decode_to_vec()
-        .map_err(|err| ImageError::InvalidDataUrl(err.to_string()))?;
+        .map_err(ImageError::invalid_data_url)?;
     reserve_image_bytes(budget, data.len())?;
     Ok(data)
 }
 
-/// Return the decoded size a data URL body reports before it is decoded.
+/// Estimate the decoded byte length of a data URL from its body length.
 ///
-/// A base64 body occupies four characters for every three bytes it carries, so
-/// the result can be up to two bytes smaller than the decoded body. A
-/// percent-encoded byte occupies three characters.
+/// For a header that ends with `;base64`, the estimate is three bytes for each
+/// complete group of four body characters. For a body that holds only base64
+/// alphabet and padding characters, the estimate differs from the decoded
+/// length by at most two bytes: padding makes it larger, and omitted padding
+/// makes it smaller. For any other header, the estimate counts each `%` and the
+/// two characters after it as one byte, which is exact when every `%` begins a
+/// two-digit hexadecimal escape. The header check is case-sensitive, while
+/// decoding also accepts spellings such as `;BASE64`; a base64 body under such
+/// a header receives the percent-encoded estimate, which is larger than its
+/// decoded length. Characters that decoding removes or combines, such as ASCII
+/// tabs and newlines, percent escapes in a base64 body, or a fragment, also
+/// make the estimate larger than the decoded length.
 fn estimated_decoded_len(data_url: &str) -> usize {
     let Some((header, body)) = data_url.split_once(',') else {
         return 0;
@@ -312,6 +373,7 @@ mod tests {
         ImageSource::Bytes {
             data: vec![0; len],
             detail: ImageDetail::High,
+            path: String::new(),
         }
     }
 
@@ -319,6 +381,15 @@ mod tests {
         ImageSource::Url {
             url: "https://example.com/image.webp".to_string(),
             detail: ImageDetail::High,
+            path: String::new(),
+        }
+    }
+
+    fn located_bytes_source(len: usize, path: &str) -> ImageSource {
+        ImageSource::Bytes {
+            data: vec![0; len],
+            detail: ImageDetail::High,
+            path: path.to_string(),
         }
     }
 
@@ -332,7 +403,14 @@ mod tests {
             .expect_err("the image exceeds the image limit");
 
         assert!(
-            matches!(error, ImageError::ImageTooLarge { size: 5, max: 4 }),
+            matches!(
+                error,
+                ImageError::ImageTooLarge {
+                    size: 5,
+                    max: 4,
+                    ..
+                }
+            ),
             "{error}"
         );
     }
@@ -347,7 +425,14 @@ mod tests {
             .expect_err("the images exceed the total limit");
 
         assert!(
-            matches!(error, ImageError::TotalSizeTooLarge { size: 12, max: 10 }),
+            matches!(
+                error,
+                ImageError::TotalSizeTooLarge {
+                    size: 12,
+                    max: 10,
+                    ..
+                }
+            ),
             "{error}"
         );
     }
@@ -362,7 +447,14 @@ mod tests {
             .expect_err("the fetched image exceeds the image limit");
 
         assert!(
-            matches!(error, ImageError::ImageTooLarge { size: 5, max: 4 }),
+            matches!(
+                error,
+                ImageError::ImageTooLarge {
+                    size: 5,
+                    max: 4,
+                    ..
+                }
+            ),
             "{error}"
         );
     }
@@ -374,6 +466,7 @@ mod tests {
         let source = ImageSource::DataUrl {
             data_url: format!("data:image/webp;base64,{}", "A".repeat(8)),
             detail: ImageDetail::High,
+            path: String::new(),
         };
         let error = resolver
             .resolve(&[source], &mut ImageQuota::new())
@@ -381,7 +474,14 @@ mod tests {
             .expect_err("the data url exceeds the image limit");
 
         assert!(
-            matches!(error, ImageError::ImageTooLarge { size: 6, max: 4 }),
+            matches!(
+                error,
+                ImageError::ImageTooLarge {
+                    size: 6,
+                    max: 4,
+                    ..
+                }
+            ),
             "{error}"
         );
     }
@@ -444,6 +544,96 @@ mod tests {
             fetcher.max_active.load(Ordering::SeqCst),
             3,
             "the resolver starts at most max_concurrent_sources fetches at a time"
+        );
+    }
+    #[tokio::test]
+    async fn errors_report_the_path_and_the_index_within_the_path() {
+        let resolver = ImageResolver::new(FixedFetcher { body_len: 0 }, NoPreprocessor)
+            .with_limits(limits(8, 64));
+        let sources = [
+            located_bytes_source(1, ".messages[0]"),
+            located_bytes_source(1, ".messages[0]"),
+            located_bytes_source(1, ".messages[2]"),
+            located_bytes_source(9, ".messages[2]"),
+        ];
+        let error = resolver
+            .resolve(&sources, &mut ImageQuota::new())
+            .await
+            .expect_err("the last image exceeds the image limit");
+
+        assert!(
+            matches!(
+                &error,
+                ImageError::ImageTooLarge { path, index: 1, size: 9, max: 8 }
+                    if path == ".messages[2]"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            ".messages[2].image[1]: image file size exceeds limit 0 MB"
+        );
+
+        let error = resolver
+            .resolve(&sources[..3], &mut ImageQuota::new())
+            .await
+            .expect_err("the preprocessor rejects every image");
+        assert!(
+            matches!(&error, ImageError::Unsupported(_)),
+            "a preprocessing failure without a location is returned unchanged: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_count_error_names_the_first_path_beyond_the_limit() {
+        let resolver = ImageResolver::new(FixedFetcher { body_len: 0 }, AcceptingPreprocessor)
+            .with_limits(ImageLimits {
+                max_images: 3,
+                ..limits(8, 64)
+            });
+        let mut quota = ImageQuota::new();
+        resolver
+            .resolve(&[located_bytes_source(1, "input[0]")], &mut quota)
+            .await
+            .expect("the first call is within the limit");
+        let sources = [
+            located_bytes_source(1, "input[1]"),
+            located_bytes_source(1, "input[2]"),
+            located_bytes_source(1, "input[2]"),
+            located_bytes_source(1, "input[3]"),
+        ];
+        let error = resolver
+            .resolve(&sources, &mut quota)
+            .await
+            .expect_err("the request exceeds the image count limit");
+
+        assert_eq!(
+            error.to_string(),
+            "input[2]: Too many images: max 3 images per request, got 4"
+        );
+        assert_eq!(quota.image_count(), 1, "a failed call records nothing");
+    }
+
+    #[tokio::test]
+    async fn the_total_size_error_names_the_crossing_source() {
+        let resolver = ImageResolver::new(FixedFetcher { body_len: 0 }, NoPreprocessor)
+            .with_limits(limits(8, 10));
+        let sources = [
+            located_bytes_source(6, "messages.0.content[0]"),
+            located_bytes_source(6, "messages.0.content[1]"),
+        ];
+        let error = resolver
+            .resolve(&sources, &mut ImageQuota::new())
+            .await
+            .expect_err("the images exceed the total limit");
+
+        assert!(
+            matches!(
+                &error,
+                ImageError::TotalSizeTooLarge { path, size: 12, max: 10 }
+                    if path == "messages.0.content[1]"
+            ),
+            "{error:?}"
         );
     }
 }

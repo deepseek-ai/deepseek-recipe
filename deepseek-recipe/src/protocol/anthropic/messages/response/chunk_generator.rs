@@ -1,20 +1,22 @@
+use crate::protocol::tool_call_id::new_tool_call_id;
 use crate::response::ProtocolResponse;
 use crate::stream::{ChunkGenerator, OutputChunk, PromptUsage};
 
 use super::schema::{
-    MessagesDelta, MessagesResponse, MessagesResponseContent, MessagesStopInfo,
-    MessagesStreamEvent, MessagesUsage,
+    MessagesContentBlockDelta, MessagesMessageDelta, MessagesResponse,
+    MessagesResponseContentBlock, MessagesStreamEvent, MessagesUsage,
 };
 
-/// Converts parsed inference output to Messages events.
+/// A chunk generator that converts parsed output into Messages events.
 #[derive(Debug)]
 pub struct MessagesChunkGenerator {
-    id: String,
+    response_id: String,
     model: String,
     thinking_mode: bool,
     signature: String,
     content_index: usize,
-    tool_call_index: usize,
+    next_tool_call_index: usize,
+    reasoning_content: String,
     active: Option<MessagesContentBlockKind>,
     prompt_usage: PromptUsage,
     started: bool,
@@ -30,17 +32,22 @@ enum MessagesContentBlockKind {
 
 impl MessagesChunkGenerator {
     /// The caller supplies a unique response ID and the public response model name.
-    /// Tool IDs are derived from that response ID and the per-response tool index.
-    /// The default opaque thinking signature is the response ID.
-    pub fn new(id: impl Into<String>, model: impl Into<String>, thinking_mode: bool) -> Self {
-        let id = id.into();
+    /// Tool IDs combine the per-response tool index, random characters, and a
+    /// checksum. The default opaque thinking signature is the response ID.
+    pub fn new(
+        response_id: impl Into<String>,
+        model: impl Into<String>,
+        thinking_mode: bool,
+    ) -> Self {
+        let response_id = response_id.into();
         Self {
-            signature: id.clone(),
-            id,
+            signature: response_id.clone(),
+            response_id,
             model: model.into(),
             thinking_mode,
             content_index: 0,
-            tool_call_index: 0,
+            next_tool_call_index: 0,
+            reasoning_content: String::new(),
             active: None,
             prompt_usage: PromptUsage::default(),
             started: false,
@@ -59,7 +66,7 @@ impl MessagesChunkGenerator {
             if kind == MessagesContentBlockKind::Thinking {
                 events.push(MessagesStreamEvent::ContentBlockDelta {
                     index: self.content_index,
-                    delta: MessagesDelta::SignatureDelta {
+                    delta: MessagesContentBlockDelta::SignatureDelta {
                         signature: self.signature.clone(),
                     },
                 });
@@ -74,7 +81,7 @@ impl MessagesChunkGenerator {
     fn open_block(
         &mut self,
         kind: MessagesContentBlockKind,
-        content_block: MessagesResponseContent,
+        content_block: MessagesResponseContentBlock,
         events: &mut Vec<MessagesStreamEvent>,
     ) {
         self.close_block(events);
@@ -88,7 +95,7 @@ impl MessagesChunkGenerator {
         self.active = Some(kind);
     }
 
-    fn delta(&self, delta: MessagesDelta) -> MessagesStreamEvent {
+    fn delta(&self, delta: MessagesContentBlockDelta) -> MessagesStreamEvent {
         MessagesStreamEvent::ContentBlockDelta {
             index: self.content_index,
             delta,
@@ -105,25 +112,25 @@ impl ChunkGenerator for MessagesChunkGenerator {
         }
         let mut events = Vec::new();
         match chunk {
-            OutputChunk::Start { usage, .. } => {
+            OutputChunk::Start { prompt_usage, .. } => {
                 if self.started {
                     return events;
                 }
                 self.started = true;
-                self.prompt_usage = usage;
+                self.prompt_usage = prompt_usage;
                 events.push(MessagesStreamEvent::MessageStart {
                     message: MessagesResponse::new(
-                        self.id.clone(),
+                        self.response_id.clone(),
                         self.model.clone(),
                         0,
-                        usage.prompt_tokens,
-                        usage.prompt_cache_hit_tokens,
+                        prompt_usage.prompt_tokens,
+                        prompt_usage.prompt_cache_hit_tokens,
                     ),
                 });
                 if self.thinking_mode {
                     self.open_block(
                         MessagesContentBlockKind::Thinking,
-                        MessagesResponseContent::Thinking {
+                        MessagesResponseContentBlock::Thinking {
                             thinking: String::new(),
                             signature: String::new(),
                         },
@@ -131,71 +138,67 @@ impl ChunkGenerator for MessagesChunkGenerator {
                     );
                 }
             }
-            OutputChunk::Raw { content } => {
+            OutputChunk::Content { content, .. } => {
                 if self.active != Some(MessagesContentBlockKind::Text) {
                     self.open_block(
                         MessagesContentBlockKind::Text,
-                        MessagesResponseContent::Text {
+                        MessagesResponseContentBlock::Text {
                             text: String::new(),
                         },
                         &mut events,
                     );
                 }
-                events.push(self.delta(MessagesDelta::TextDelta { text: content }));
+                events.push(self.delta(MessagesContentBlockDelta::TextDelta { text: content }));
             }
-            OutputChunk::Reasoning { content } => {
+            OutputChunk::Reasoning { content, .. } => {
                 if self.active != Some(MessagesContentBlockKind::Thinking) {
                     self.open_block(
                         MessagesContentBlockKind::Thinking,
-                        MessagesResponseContent::Thinking {
+                        MessagesResponseContentBlock::Thinking {
                             thinking: String::new(),
                             signature: String::new(),
                         },
                         &mut events,
                     );
                 }
-                events.push(self.delta(MessagesDelta::ThinkingDelta { thinking: content }));
+                self.reasoning_content.push_str(&content);
+                events.push(
+                    self.delta(MessagesContentBlockDelta::ThinkingDelta { thinking: content }),
+                );
             }
-            OutputChunk::ToolCall {
-                tool_name,
-                arguments,
-            } => {
-                let id = format!("toolu_{}_{}", self.id, self.tool_call_index);
-                self.tool_call_index += 1;
-                let input = if arguments.is_empty() {
-                    serde_json::json!({})
-                } else {
-                    serde_json::from_str(&arguments).unwrap_or_else(|_| serde_json::json!({}))
-                };
+            OutputChunk::ToolCallNamed { tool_name } => {
+                let empty_thinking = self.thinking_mode && self.reasoning_content.is_empty();
+                let id = new_tool_call_id(self.next_tool_call_index, empty_thinking);
+                self.next_tool_call_index += 1;
                 self.open_block(
                     MessagesContentBlockKind::ToolUse,
-                    MessagesResponseContent::ToolUse {
+                    MessagesResponseContentBlock::ToolUse {
                         id,
                         name: tool_name,
-                        input,
+                        input: serde_json::json!({}),
                     },
                     &mut events,
                 );
             }
-            OutputChunk::ToolArgumentsDelta { content } => {
+            OutputChunk::ToolCallArgumentsDelta { arguments } => {
                 if self.active == Some(MessagesContentBlockKind::ToolUse) {
-                    events.push(self.delta(MessagesDelta::InputJsonDelta {
-                        partial_json: content,
+                    events.push(self.delta(MessagesContentBlockDelta::InputJsonDelta {
+                        partial_json: arguments,
                     }));
                 }
             }
             OutputChunk::Finish {
-                reason,
+                finish_reason,
                 stop_sequence,
-                usage,
+                completion_usage,
             } => {
                 self.close_block(&mut events);
                 events.push(MessagesStreamEvent::MessageDelta {
-                    delta: MessagesStopInfo {
-                        stop_reason: Some(reason.into()),
+                    delta: MessagesMessageDelta {
+                        stop_reason: Some(finish_reason.into()),
                         stop_sequence,
                     },
-                    usage: MessagesUsage::from((self.prompt_usage, usage)),
+                    usage: MessagesUsage::from((self.prompt_usage, completion_usage)),
                 });
                 events.push(MessagesStreamEvent::MessageStop);
                 self.finished = true;

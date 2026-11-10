@@ -6,8 +6,9 @@ build-backend = "maturin"
 # The distribution name of PyPI; the import name stays `deepseek_recipe`. The
 # Cargo package of this crate, and its directory, keep their own name.
 name = "deepseek-recipe"
-# The version of the distribution; the Cargo packages keep their own version.
-version = "0.1.1"
+# maturin reads the version from the Cargo package, which inherits the
+# workspace version, so the distribution, the crates, and `__version__` match.
+dynamic = ["version"]
 description = "Python bindings for deepseek-recipe components"
 readme = "README.md"
 requires-python = ">=3.10"

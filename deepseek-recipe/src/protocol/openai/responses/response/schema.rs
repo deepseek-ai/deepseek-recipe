@@ -1,27 +1,137 @@
 use serde::Serialize;
 use strum_macros::IntoStaticStr;
 
+use crate::openai::responses::request::{
+    ResponsesReasoningConfig, ResponsesTextConfig, ResponsesTool, ResponsesToolChoice,
+    ResponsesToolSearchExecution,
+};
 use crate::response::ProtocolResponse;
-use crate::stream::{CompletionUsage, PromptUsage};
+use crate::stream::{CompletionUsage, PromptUsage, TokenLogprob};
 
 use super::chunk_generator::ResponsesChunkGenerator;
 
-/// A complete Responses response with event accumulation.
+/// A complete Responses response, also usable as an accumulator for generated
+/// events.
 /// Deltas append, done events replace values, and full responses replace state.
-/// Incremental events with mismatched indices, IDs, or types are ignored.
+/// Incremental events with mismatched indices, IDs, or types are not applied.
+///
+/// Request settings come from [`ResponsesEcho`]. Settings for unsupported
+/// features (background mode, stored responses, penalties, tool call limits,
+/// moderation, prompt caching, service tiers, truncation, and metadata) report
+/// fixed defaults.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesResponse {
     pub id: String,
     pub object: &'static str,
     pub created_at: u64,
-    pub model: String,
     pub status: ResponsesStatus,
+    pub background: bool,
     pub completed_at: Option<u64>,
+    pub content_filters: Option<serde_json::Value>,
     pub error: Option<ResponsesError>,
+    pub frequency_penalty: f32,
     pub incomplete_details: Option<ResponsesIncompleteDetails>,
+    pub instructions: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+    pub model: String,
+    pub moderation: Option<String>,
     pub output: Vec<ResponsesOutputItem>,
-    /// Usage is null until `Finish`; constructor token counts are ignored.
+    pub parallel_tool_calls: bool,
+    pub presence_penalty: f32,
+    pub previous_response_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
+    pub reasoning: ResponsesReasoningConfig,
+    pub safety_identifier: Option<String>,
+    pub service_tier: &'static str,
+    pub store: bool,
+    pub temperature: f32,
+    pub text: ResponsesTextConfig,
+    pub tool_choice: ResponsesToolChoice,
+    pub tools: Vec<ResponsesTool>,
+    pub top_logprobs: u8,
+    pub top_p: f32,
+    pub truncation: &'static str,
+    /// Null until the chunk generator handles [`OutputChunk::Finish`]. The
+    /// token counts passed to [`ProtocolResponse::new`] are ignored.
+    ///
+    /// [`OutputChunk::Finish`]: crate::stream::OutputChunk::Finish
     pub usage: Option<ResponsesUsage>,
+    pub user: Option<String>,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Request settings that a response reports, as the request specified them.
+///
+/// Conversion preserves these settings for the chunk generator.
+/// [`ResponsesRequest::echo`] reads them before conversion, and
+/// [`ResponsesChunkGenerator::with_echo`] overrides them. The default reports
+/// an unspecified request.
+///
+/// [`ResponsesRequest::echo`]: crate::openai::ResponsesRequest::echo
+#[derive(Debug, Clone)]
+pub struct ResponsesEcho {
+    pub instructions: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    /// The requested reasoning settings, with `generate_summary` merged into
+    /// an unset `summary`.
+    pub reasoning: ResponsesReasoningConfig,
+    /// The requested temperature or 1.0, not the sampling temperature.
+    pub temperature: f32,
+    pub text: ResponsesTextConfig,
+    pub tool_choice: ResponsesToolChoice,
+    /// Declared tools, without unsupported tool types.
+    pub tools: Vec<ResponsesTool>,
+    pub top_logprobs: u8,
+    /// The requested `top_p` or 1.0, not the sampling `top_p`.
+    pub top_p: f32,
+    pub user: Option<String>,
+}
+
+impl Default for ResponsesEcho {
+    fn default() -> Self {
+        Self {
+            instructions: None,
+            max_output_tokens: None,
+            reasoning: ResponsesReasoningConfig::default(),
+            temperature: 1.0,
+            text: ResponsesTextConfig::default(),
+            tool_choice: ResponsesToolChoice::default(),
+            tools: Vec::new(),
+            top_logprobs: 0,
+            top_p: 1.0,
+            user: None,
+        }
+    }
+}
+
+impl ResponsesResponse {
+    /// Set the request settings that the response reports to `echo`.
+    pub(super) fn set_echo(&mut self, echo: ResponsesEcho) {
+        let ResponsesEcho {
+            instructions,
+            max_output_tokens,
+            reasoning,
+            temperature,
+            text,
+            tool_choice,
+            tools,
+            top_logprobs,
+            top_p,
+            user,
+        } = echo;
+        self.instructions = instructions;
+        self.max_output_tokens = max_output_tokens;
+        self.reasoning = reasoning;
+        self.temperature = temperature;
+        self.text = text;
+        self.tool_choice = tool_choice;
+        self.tools = tools;
+        self.top_logprobs = top_logprobs;
+        self.top_p = top_p;
+        self.user = user;
+    }
 }
 
 /// Response and output item states generated from parsed output chunks.
@@ -33,8 +143,8 @@ pub enum ResponsesStatus {
     Incomplete,
 }
 
-/// Error fields for a complete response. Parsed output chunks contain no error
-/// information, so generated responses set `error` to null.
+/// The `error` fields of a response object. Generated responses set `error`
+/// to null.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesError {
     pub code: String,
@@ -53,6 +163,8 @@ pub enum ResponsesIncompleteReason {
     ContentFilter,
 }
 
+/// An item in the `output` of a response.
+///
 /// Output items retain their position in the response throughout streaming.
 /// Item IDs identify output items in events. Call IDs associate subsequent
 /// tool results with their calls.
@@ -71,6 +183,9 @@ pub enum ResponsesOutputItem {
         status: ResponsesStatus,
         content: Vec<ResponsesContentPart>,
         summary: Vec<()>,
+        /// An identifier of the reasoning, `{response_id}-0`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     FunctionCall {
         id: String,
@@ -88,21 +203,66 @@ pub enum ResponsesOutputItem {
         name: String,
         input: String,
     },
+    ToolSearchCall {
+        id: String,
+        status: ResponsesStatus,
+        call_id: String,
+        execution: ResponsesToolSearchExecution,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        #[serde(skip)]
+        raw_arguments: String,
+    },
 }
 
 /// Content produced from parsed model output.
-/// Annotations and log probabilities are emitted as empty arrays.
+/// Annotations are emitted as empty arrays. Log probabilities are empty unless
+/// the inference output carries them.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesContentPart {
     OutputText {
         annotations: Vec<()>,
-        logprobs: Vec<()>,
+        logprobs: Vec<ResponsesTokenLogprob>,
         text: String,
     },
     ReasoningText {
         text: String,
     },
+}
+
+/// The log probability of one output text token.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<ResponsesTopLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesTopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+}
+
+impl From<&TokenLogprob> for ResponsesTokenLogprob {
+    fn from(logprob: &TokenLogprob) -> Self {
+        Self {
+            token: logprob.token.clone(),
+            logprob: logprob.logprob,
+            bytes: Some(logprob.bytes.clone()),
+            top_logprobs: logprob
+                .top_logprobs
+                .iter()
+                .map(|top_logprob| ResponsesTopLogprob {
+                    token: top_logprob.token.clone(),
+                    logprob: top_logprob.logprob,
+                    bytes: Some(top_logprob.bytes.clone()),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -111,8 +271,9 @@ pub enum ResponsesRole {
     Assistant,
 }
 
-/// Answer content immediately before a tool call uses `commentary` in the
-/// completed output item.
+/// The phase of a message output item. A message whose answer content
+/// immediately precedes a tool call has `commentary` in the completed output
+/// item; other messages have `final_answer`.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesPhase {
@@ -138,7 +299,7 @@ pub struct ResponsesInputTokensDetails {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ResponsesOutputTokensDetails {
-    /// Always zero because the backend reports no reasoning token count.
+    /// The reasoning token count, or zero without one.
     pub reasoning_tokens: usize,
 }
 
@@ -151,7 +312,7 @@ impl From<(PromptUsage, CompletionUsage)> for ResponsesUsage {
             },
             output_tokens: completion.completion_tokens,
             output_tokens_details: ResponsesOutputTokensDetails {
-                reasoning_tokens: 0,
+                reasoning_tokens: completion.reasoning_tokens.unwrap_or(0),
             },
             total_tokens: prompt.prompt_tokens + completion.completion_tokens,
         }
@@ -197,7 +358,7 @@ pub enum ResponsesStreamEvent {
         content_index: usize,
         delta: String,
         item_id: String,
-        logprobs: Vec<()>,
+        logprobs: Vec<ResponsesTokenLogprob>,
         output_index: usize,
         sequence_number: usize,
     },
@@ -206,7 +367,7 @@ pub enum ResponsesStreamEvent {
     OutputTextDone {
         content_index: usize,
         item_id: String,
-        logprobs: Vec<()>,
+        logprobs: Vec<ResponsesTokenLogprob>,
         output_index: usize,
         sequence_number: usize,
         text: String,
@@ -301,21 +462,58 @@ impl ProtocolResponse for ResponsesResponse {
         _prompt_tokens: usize,
         _prompt_cache_hit_tokens: usize,
     ) -> Self {
+        let ResponsesEcho {
+            instructions,
+            max_output_tokens,
+            reasoning,
+            temperature,
+            text,
+            tool_choice,
+            tools,
+            top_logprobs,
+            top_p,
+            user,
+        } = ResponsesEcho::default();
         Self {
             id,
             object: "response",
             created_at: created,
-            model,
             status: ResponsesStatus::InProgress,
+            background: false,
             completed_at: None,
+            content_filters: None,
             error: None,
+            frequency_penalty: 0.0,
             incomplete_details: None,
+            instructions,
+            max_output_tokens,
+            max_tool_calls: None,
+            model,
+            moderation: None,
             output: vec![],
+            parallel_tool_calls: true,
+            presence_penalty: 0.0,
+            previous_response_id: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning,
+            safety_identifier: None,
+            service_tier: "default",
+            store: false,
+            temperature,
+            text,
+            tool_choice,
+            tools,
+            top_logprobs,
+            top_p,
+            truncation: "disabled",
             usage: None,
+            user,
+            metadata: serde_json::Map::new(),
         }
     }
 
-    fn chunk_event_type(chunk: &ResponsesStreamEvent) -> Option<&'static str> {
+    fn sse_event_name(chunk: &ResponsesStreamEvent) -> Option<&'static str> {
         Some(chunk.into())
     }
 }

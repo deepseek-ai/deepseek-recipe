@@ -1,28 +1,42 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::protocol::openai::responses::request::ResponsesToolSearchExecution;
+use crate::protocol::tool_call_id::new_tool_call_id;
+use crate::request::ResponseOptions;
 use crate::response::ProtocolResponse;
-use crate::stream::{ChunkGenerator, FinishReason, OutputChunk, PromptUsage};
+use crate::stream::{ChunkGenerator, FinishReason, OutputChunk, PromptUsage, TokenLogprob};
 
 use super::custom_tool_input::ResponsesCustomToolInputParser;
 use super::schema::{
-    ResponsesContentPart, ResponsesIncompleteDetails, ResponsesIncompleteReason,
+    ResponsesContentPart, ResponsesEcho, ResponsesIncompleteDetails, ResponsesIncompleteReason,
     ResponsesOutputItem, ResponsesPhase, ResponsesResponse, ResponsesRole, ResponsesStatus,
-    ResponsesStreamEvent, ResponsesUsage,
+    ResponsesStreamEvent, ResponsesTokenLogprob, ResponsesUsage,
 };
 
-/// Generate Responses events from one `Start` to `Finish` sequence.
-/// Repeated starts and chunks outside this sequence are ignored.
+/// A chunk generator that converts one [`OutputChunk::Start`] to
+/// [`OutputChunk::Finish`] sequence into Responses events.
+///
+/// Created by [`ResponsesRequest::chunk_generator`].
+///
+/// The generator ignores a repeated `Start` and chunks outside this sequence.
 /// Argument deltas extend only the active tool call.
-/// Custom tool output requires `with_custom_tool_names`.
-/// Other tools retain their model names, including flattened namespaces.
+/// Namespace tool names and reported request settings come from conversion;
+/// [`Self::with_namespace_tool_map`] and [`Self::with_echo`] override them.
+///
+/// [`ResponsesRequest::chunk_generator`]:
+///     crate::request::ProtocolRequest::chunk_generator
 #[derive(Debug)]
 pub struct ResponsesChunkGenerator {
     response: ResponsesResponse,
     active: Option<usize>,
     sequence_number: usize,
-    tool_call_index: usize,
+    next_tool_call_index: usize,
+    thinking_mode: bool,
+    reasoning_content: String,
     custom_tool_names: HashSet<String>,
+    namespace_tool_map: Option<HashMap<String, (String, String)>>,
+    client_tool_search: bool,
     custom_tool_input: Option<ResponsesCustomToolInputParser>,
     prompt_usage: PromptUsage,
     started: bool,
@@ -35,15 +49,33 @@ enum ResponsesTextKind {
 }
 
 impl ResponsesChunkGenerator {
-    /// Use a unique response ID and public model name.
-    /// Item and call IDs derive from the response ID and indices.
-    pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Construct a generator for one response.
+    ///
+    /// The caller supplies a unique response ID, the public model name, and
+    /// the thinking mode. Item IDs derive from the response ID and output
+    /// indices, and the generator creates call IDs. In thinking mode, the ID
+    /// of a tool call from a turn without reasoning content carries the
+    /// empty-thinking marker.
+    pub(crate) fn new(
+        id: impl Into<String>,
+        model: impl Into<String>,
+        thinking_mode: bool,
+        response_options: ResponseOptions,
+    ) -> Self {
+        let mut response = ResponsesResponse::new(id.into(), model.into(), timestamp(), 0, 0);
+        if let Some(echo) = response_options.responses_echo {
+            response.set_echo(echo);
+        }
         Self {
-            response: ResponsesResponse::new(id.into(), model.into(), timestamp(), 0, 0),
+            response,
             active: None,
             sequence_number: 0,
-            tool_call_index: 0,
-            custom_tool_names: HashSet::new(),
+            next_tool_call_index: 0,
+            thinking_mode,
+            reasoning_content: String::new(),
+            custom_tool_names: response_options.custom_tool_names,
+            namespace_tool_map: response_options.namespace_tool_map,
+            client_tool_search: response_options.client_tool_search,
             custom_tool_input: None,
             prompt_usage: PromptUsage::default(),
             started: false,
@@ -51,11 +83,36 @@ impl ResponsesChunkGenerator {
         }
     }
 
-    /// Set declared custom tool names whose JSON `input` strings are decoded.
-    /// Defaults to an empty set; other tools retain their function arguments.
-    pub fn with_custom_tool_names(mut self, custom_tool_names: HashSet<String>) -> Self {
-        self.custom_tool_names = custom_tool_names;
+    /// Set the function names of namespace tools mapped to their namespace and
+    /// local name, from [`crate::openai::ResponsesRequest::namespace_tool_map`].
+    /// A tool call whose name is not in the map has no namespace.
+    pub fn with_namespace_tool_map(
+        mut self,
+        namespace_tool_map: HashMap<String, (String, String)>,
+    ) -> Self {
+        self.namespace_tool_map = Some(namespace_tool_map);
         self
+    }
+
+    /// Set the request settings that response objects report, from
+    /// [`crate::openai::ResponsesRequest::echo`].
+    pub fn with_echo(mut self, echo: ResponsesEcho) -> Self {
+        self.response.set_echo(echo);
+        self
+    }
+
+    /// Resolve a tool call name to its local name and namespace.
+    fn resolve_namespace(&self, tool_name: String) -> (String, Option<String>) {
+        match &self.namespace_tool_map {
+            Some(names) => match names.get(&tool_name) {
+                Some((namespace, name)) => (name.clone(), Some(namespace.clone())),
+                None => (tool_name, None),
+            },
+            None => match tool_name.split_once("::") {
+                Some((namespace, name)) => (name.to_string(), Some(namespace.to_string())),
+                None => (tool_name, None),
+            },
+        }
     }
 
     fn next_sequence_number(&mut self) -> usize {
@@ -73,7 +130,8 @@ impl ResponsesChunkGenerator {
                 content.pop().map(|part| (id.clone(), part))
             }
             ResponsesOutputItem::FunctionCall { .. }
-            | ResponsesOutputItem::CustomToolCall { .. } => None,
+            | ResponsesOutputItem::CustomToolCall { .. }
+            | ResponsesOutputItem::ToolSearchCall { .. } => None,
         };
         self.active = Some(output_index);
         events.push(ResponsesStreamEvent::OutputItemAdded {
@@ -117,6 +175,21 @@ impl ResponsesChunkGenerator {
                 status: item_status,
                 ..
             } => *item_status = status,
+            ResponsesOutputItem::ToolSearchCall {
+                status: item_status,
+                arguments,
+                raw_arguments,
+                ..
+            } => {
+                if status == ResponsesStatus::Completed
+                    && let Ok(parsed) = serde_json::from_str(raw_arguments)
+                {
+                    *arguments = parsed;
+                    *item_status = ResponsesStatus::Completed;
+                } else {
+                    *item_status = ResponsesStatus::Incomplete;
+                }
+            }
         }
         let item = item.clone();
         match &item {
@@ -170,6 +243,7 @@ impl ResponsesChunkGenerator {
                     sequence_number: self.next_sequence_number(),
                 });
             }
+            ResponsesOutputItem::ToolSearchCall { .. } => {}
         }
         events.push(ResponsesStreamEvent::OutputItemDone {
             item,
@@ -178,9 +252,13 @@ impl ResponsesChunkGenerator {
         });
     }
 
+    /// Append text to the active message or reasoning item, opening one when
+    /// needed. Output text keeps its token log probabilities; reasoning text
+    /// drops them.
     fn append_text(
         &mut self,
         delta: String,
+        logprobs: Option<&[TokenLogprob]>,
         kind: ResponsesTextKind,
         events: &mut Vec<ResponsesStreamEvent>,
     ) {
@@ -204,6 +282,7 @@ impl ResponsesChunkGenerator {
                         text: String::new(),
                     }],
                     summary: Vec::new(),
+                    encrypted_content: Some(format!("{}-0", self.response.id)),
                 }
             } else {
                 ResponsesOutputItem::Message {
@@ -227,14 +306,22 @@ impl ResponsesChunkGenerator {
             ResponsesOutputItem::Message { id, content, .. }
             | ResponsesOutputItem::Reasoning { id, content, .. } => (id.clone(), content),
             ResponsesOutputItem::FunctionCall { .. }
-            | ResponsesOutputItem::CustomToolCall { .. } => return,
+            | ResponsesOutputItem::CustomToolCall { .. }
+            | ResponsesOutputItem::ToolSearchCall { .. } => return,
         };
         let Some(part) = content.first_mut() else {
             return;
         };
+        let delta_logprobs: Vec<ResponsesTokenLogprob> = logprobs
+            .filter(|_| !reasoning)
+            .map(|logprobs| logprobs.iter().map(Into::into).collect())
+            .unwrap_or_default();
         match part {
-            ResponsesContentPart::OutputText { text, .. }
-            | ResponsesContentPart::ReasoningText { text } => text.push_str(&delta),
+            ResponsesContentPart::OutputText { text, logprobs, .. } => {
+                text.push_str(&delta);
+                logprobs.extend(delta_logprobs.iter().cloned());
+            }
+            ResponsesContentPart::ReasoningText { text } => text.push_str(&delta),
         }
         let sequence_number = self.next_sequence_number();
         events.push(if reasoning {
@@ -250,7 +337,7 @@ impl ResponsesChunkGenerator {
                 content_index: 0,
                 delta,
                 item_id,
-                logprobs: Vec::new(),
+                logprobs: delta_logprobs,
                 output_index,
                 sequence_number,
             }
@@ -290,12 +377,12 @@ impl ChunkGenerator for ResponsesChunkGenerator {
         }
         let mut events = Vec::new();
         match chunk {
-            OutputChunk::Start { usage, .. } => {
+            OutputChunk::Start { prompt_usage, .. } => {
                 if self.started {
                     return events;
                 }
                 self.started = true;
-                self.prompt_usage = usage;
+                self.prompt_usage = prompt_usage;
                 events.push(ResponsesStreamEvent::Created {
                     response: self.response.clone(),
                     sequence_number: self.next_sequence_number(),
@@ -305,16 +392,19 @@ impl ChunkGenerator for ResponsesChunkGenerator {
                     sequence_number: self.next_sequence_number(),
                 });
             }
-            OutputChunk::Raw { content } => {
-                self.append_text(content, ResponsesTextKind::Output, &mut events);
+            OutputChunk::Content { content, logprobs } => {
+                self.append_text(
+                    content,
+                    logprobs.as_deref(),
+                    ResponsesTextKind::Output,
+                    &mut events,
+                );
             }
-            OutputChunk::Reasoning { content } => {
-                self.append_text(content, ResponsesTextKind::Reasoning, &mut events);
+            OutputChunk::Reasoning { content, .. } => {
+                self.reasoning_content.push_str(&content);
+                self.append_text(content, None, ResponsesTextKind::Reasoning, &mut events);
             }
-            OutputChunk::ToolCall {
-                tool_name,
-                arguments,
-            } => {
+            OutputChunk::ToolCallNamed { tool_name } => {
                 if let Some(output_index) = self.active
                     && let ResponsesOutputItem::Message { phase, .. } =
                         &mut self.response.output[output_index]
@@ -323,44 +413,49 @@ impl ChunkGenerator for ResponsesChunkGenerator {
                 }
                 self.close_item(ResponsesStatus::Completed, &mut events);
                 let output_index = self.response.output.len();
-                let call_id = format!("call_{}_{}", self.response.id, self.tool_call_index);
+                let empty_thinking = self.thinking_mode && self.reasoning_content.is_empty();
+                let call_id = new_tool_call_id(self.next_tool_call_index, empty_thinking);
                 let item = if self.custom_tool_names.contains(&tool_name) {
-                    let mut parser = ResponsesCustomToolInputParser::default();
-                    let input = parser.feed(&arguments);
-                    self.custom_tool_input = Some(parser);
+                    self.custom_tool_input = Some(ResponsesCustomToolInputParser::default());
                     ResponsesOutputItem::CustomToolCall {
                         id: format!("ctc_{}_{output_index}", self.response.id),
                         status: ResponsesStatus::InProgress,
                         call_id,
                         name: tool_name,
-                        input,
+                        input: String::new(),
+                    }
+                } else if self.client_tool_search && tool_name == "tool_search" {
+                    ResponsesOutputItem::ToolSearchCall {
+                        id: format!("tsc_{}_{output_index}", self.response.id),
+                        status: ResponsesStatus::InProgress,
+                        call_id,
+                        execution: ResponsesToolSearchExecution::Client,
+                        arguments: serde_json::Map::new(),
+                        raw_arguments: String::new(),
                     }
                 } else {
-                    let (name, namespace) = match tool_name.split_once("::") {
-                        Some((namespace, name)) => (name.to_string(), Some(namespace.to_string())),
-                        None => (tool_name, None),
-                    };
+                    let (name, namespace) = self.resolve_namespace(tool_name);
                     ResponsesOutputItem::FunctionCall {
                         id: format!("fc_{}_{output_index}", self.response.id),
                         status: ResponsesStatus::InProgress,
                         call_id,
                         name,
                         namespace,
-                        arguments,
+                        arguments: String::new(),
                     }
                 };
-                self.tool_call_index += 1;
+                self.next_tool_call_index += 1;
                 self.open_item(item, &mut events);
             }
-            OutputChunk::ToolArgumentsDelta { content } => {
+            OutputChunk::ToolCallArgumentsDelta { arguments: delta } => {
                 if let Some(output_index) = self.active
                     && let ResponsesOutputItem::FunctionCall { id, arguments, .. } =
                         &mut self.response.output[output_index]
                 {
-                    arguments.push_str(&content);
+                    arguments.push_str(&delta);
                     let item_id = id.clone();
                     events.push(ResponsesStreamEvent::FunctionCallArgumentsDelta {
-                        delta: content,
+                        delta,
                         item_id,
                         output_index,
                         sequence_number: self.next_sequence_number(),
@@ -368,12 +463,21 @@ impl ChunkGenerator for ResponsesChunkGenerator {
                 } else if let Some(output_index) = self.active
                     && let Some(parser) = &mut self.custom_tool_input
                 {
-                    let delta = parser.feed(&content);
+                    let delta = parser.feed(&delta);
                     self.append_custom_input(output_index, delta, &mut events);
+                } else if let Some(output_index) = self.active
+                    && let ResponsesOutputItem::ToolSearchCall { raw_arguments, .. } =
+                        &mut self.response.output[output_index]
+                {
+                    raw_arguments.push_str(&delta);
                 }
             }
-            OutputChunk::Finish { reason, usage, .. } => {
-                let incomplete_reason = match reason {
+            OutputChunk::Finish {
+                finish_reason,
+                completion_usage,
+                ..
+            } => {
+                let incomplete_reason = match finish_reason {
                     FinishReason::Length => Some(ResponsesIncompleteReason::MaxOutputTokens),
                     FinishReason::ContentFilter => Some(ResponsesIncompleteReason::ContentFilter),
                     FinishReason::Stop
@@ -388,20 +492,22 @@ impl ChunkGenerator for ResponsesChunkGenerator {
                 } else {
                     ResponsesStatus::Completed
                 };
-                self.response.usage = Some(ResponsesUsage::from((self.prompt_usage, usage)));
+                self.response.usage =
+                    Some(ResponsesUsage::from((self.prompt_usage, completion_usage)));
                 self.response.completed_at = Some(timestamp());
                 self.close_item(self.response.status, &mut events);
                 let response = self.response.clone();
                 let sequence_number = self.next_sequence_number();
-                events.push(if self.response.status == ResponsesStatus::Incomplete {
-                    ResponsesStreamEvent::Incomplete {
+                events.push(match self.response.status {
+                    ResponsesStatus::Incomplete => ResponsesStreamEvent::Incomplete {
                         response,
                         sequence_number,
-                    }
-                } else {
-                    ResponsesStreamEvent::Completed {
-                        response,
-                        sequence_number,
+                    },
+                    ResponsesStatus::InProgress | ResponsesStatus::Completed => {
+                        ResponsesStreamEvent::Completed {
+                            response,
+                            sequence_number,
+                        }
                     }
                 });
                 self.finished = true;

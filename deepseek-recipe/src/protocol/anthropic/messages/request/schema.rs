@@ -1,17 +1,26 @@
+use deepseek_recipe_core::multimodal::ImageMediaType;
+use deepseek_recipe_macros::UntaggedDeserialize;
 use serde::Deserialize;
+
+pub use crate::protocol::reasoning::{RequestReasoningEffort, ThinkingType};
 
 /// An Anthropic Messages request. Unknown top-level fields are ignored.
 ///
-/// Model selection, execution and usage accounting are the caller's
-/// responsibility. Images are supported. Document blocks become the text
-/// `[Unsupported Document]`; their contents are discarded. `web_search` server
-/// tools are rejected by default; see
+/// Conversion resolves the model version through
+/// [`ConversionOptions::model_versions_by_name`]; inference execution, tool
+/// execution, and usage accounting belong to the caller. Images are supported.
+/// Document blocks become the text
+/// `[Unsupported document type: {media_type}]`; their contents are discarded.
+/// `web_search` server tools are rejected by default; see
 /// [`crate::request::WebSearchBehavior`].
+///
+/// [`ConversionOptions::model_versions_by_name`]:
+///     crate::request::ConversionOptions::model_versions_by_name
 #[derive(Debug, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
     pub messages: Vec<MessagesMessage>,
-    pub system: Option<MessagesTextOrTextBlocks>,
+    pub system: Option<MessagesSystemContent>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -21,6 +30,14 @@ pub struct MessagesRequest {
     pub tool_choice: Option<MessagesToolChoice>,
     pub thinking: Option<MessagesThinking>,
     pub output_config: Option<MessagesOutputConfig>,
+    /// Validated during deserialization and ignored by conversion.
+    pub metadata: Option<MessagesMetadata>,
+}
+
+/// Request metadata.
+#[derive(Debug, Deserialize)]
+pub struct MessagesMetadata {
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,41 +45,61 @@ pub struct MessagesRequest {
 pub enum MessagesMessage {
     User(MessagesContent),
     Assistant(MessagesContent),
-    /// Compatibility extension, rendered as a user system-reminder.
-    System(MessagesTextOrTextBlocks),
+    System(MessagesContent),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, UntaggedDeserialize)]
+#[untagged_deserialize(error = "expected a string or a list")]
 pub enum MessagesContent {
+    #[untagged_deserialize(pattern = String(_))]
     Raw(String),
+    #[untagged_deserialize(pattern = Array(_))]
     Blocks(Vec<MessagesContentBlock>),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MessagesTextOrTextBlocks {
+/// The top-level `system` field: a string or a list of text blocks.
+#[derive(Debug, UntaggedDeserialize)]
+#[untagged_deserialize(error = "expected a string or a list")]
+pub enum MessagesSystemContent {
+    #[untagged_deserialize(pattern = String(_))]
     Raw(String),
-    Blocks(Vec<MessagesTextBlock>),
+    #[untagged_deserialize(pattern = Array(_))]
+    Blocks(Vec<MessagesSystemBlock>),
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum MessagesTextBlock {
+pub enum MessagesSystemBlock {
+    Text { text: String },
+}
+
+/// The content of a `tool_result` block.
+#[derive(Debug, UntaggedDeserialize)]
+#[untagged_deserialize(error = "expected a string or a list")]
+pub enum MessagesToolResultContent {
+    #[untagged_deserialize(pattern = String(_))]
+    Raw(String),
+    #[untagged_deserialize(pattern = Array(_))]
+    Blocks(Vec<MessagesToolResultBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagesToolResultBlock {
     Text {
         text: String,
-    },
-    ToolReference {
-        tool_name: String,
     },
     Image {
         source: MessagesImageSource,
     },
-    /// Documents are rendered as an unsupported-document placeholder.
-    Document,
-    /// Recognized during deserialization, rejected during conversion.
-    #[serde(other)]
-    Unsupported,
+    /// Conversion writes the unsupported-document text in place of a document.
+    Document {
+        source: MessagesDocumentSource,
+    },
+    /// Conversion writes the referenced tool name as plain text.
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 /// One image referenced by inline data, URL, or file identifier. A file
@@ -71,8 +108,7 @@ pub enum MessagesTextBlock {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagesImageSource {
     Base64 {
-        /// Declared media type, validated against the supported image types.
-        media_type: String,
+        media_type: MessagesImageMediaType,
         data: String,
     },
     Url {
@@ -83,33 +119,53 @@ pub enum MessagesImageSource {
     },
 }
 
+/// A supported image media type, matched exactly. `image/jpg` is an alias of
+/// `image/jpeg`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub enum MessagesImageMediaType {
+    #[serde(rename = "image/jpeg", alias = "image/jpg")]
+    Jpeg,
+    #[serde(rename = "image/png")]
+    Png,
+    #[serde(rename = "image/gif")]
+    Gif,
+    #[serde(rename = "image/webp")]
+    Webp,
+}
+
+impl From<MessagesImageMediaType> for ImageMediaType {
+    fn from(media_type: MessagesImageMediaType) -> Self {
+        match media_type {
+            MessagesImageMediaType::Jpeg => Self::Jpeg,
+            MessagesImageMediaType::Png => Self::Png,
+            MessagesImageMediaType::Gif => Self::Gif,
+            MessagesImageMediaType::Webp => Self::Webp,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MessagesDocumentSource {
+    pub media_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagesContentBlock {
     Text {
         text: String,
     },
-    ToolReference {
-        tool_name: String,
+    Image {
+        source: MessagesImageSource,
     },
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolResult {
-        tool_use_id: String,
-        content: Option<MessagesTextOrTextBlocks>,
-        /// Accepted for compatibility; the result text is preserved either way.
-        is_error: Option<bool>,
+    /// Conversion writes the unsupported-document text in place of a document.
+    Document {
+        source: MessagesDocumentSource,
     },
     Thinking {
         /// Signature data available to the caller before conversion.
         signature: Option<String>,
         thinking: String,
-    },
-    Image {
-        source: MessagesImageSource,
     },
     /// A server tool invocation. Assistant messages only; dropped or rejected
     /// per [`crate::request::ConversionOptions::messages_web_search`].
@@ -118,37 +174,71 @@ pub enum MessagesContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Option<MessagesToolResultContent>,
+        /// Accepted for compatibility; the result text is preserved either way.
+        is_error: Option<bool>,
+    },
     /// A server tool result. Assistant messages only; dropped or rejected per
     /// [`crate::request::ConversionOptions::messages_web_search`].
     WebSearchToolResult {
         tool_use_id: String,
         content: serde_json::Value,
     },
-    /// Documents are rendered as an unsupported-document placeholder.
-    Document,
-    #[serde(other)]
-    Unsupported,
+    ToolAddition {
+        tool: MessagesToolReference,
+    },
 }
 
-/// A client tool declaration. A `type` starting with `web_search` is dropped or
-/// rejected per [`crate::request::ConversionOptions::messages_web_search`];
-/// other `type` discriminators are rejected as unsupported.
 #[derive(Debug, Deserialize)]
-pub struct MessagesTool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Option<serde_json::Value>,
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagesToolReference {
+    ToolReference { name: String },
 }
 
+/// A tool declaration. An object with a `type` field is a server tool; any
+/// other object is a client tool and requires `name`.
+#[derive(Debug, UntaggedDeserialize)]
+#[untagged_deserialize(error = "missing field `name`")]
+pub enum MessagesTool {
+    /// A `type` starting with `web_search` is dropped or rejected per
+    /// [`crate::request::ConversionOptions::messages_web_search`]; other types
+    /// are rejected as unsupported.
+    #[untagged_deserialize(field = "type")]
+    Server(MessagesServerTool),
+    #[untagged_deserialize(field = "name")]
+    Client {
+        name: String,
+        description: Option<String>,
+        /// The input schema; a missing schema is `null` and fails validation.
+        input_schema: serde_json::Value,
+        defer_loading: Option<bool>,
+    },
+}
+
+/// A server tool declaration.
+#[derive(Debug, Deserialize)]
+pub struct MessagesServerTool {
+    pub r#type: String,
+    pub name: Option<String>,
+}
+
+/// The tool choice. Deserialization validates `disable_parallel_tool_use` as a
+/// boolean, and conversion ignores it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagesToolChoice {
     Auto {
         disable_parallel_tool_use: Option<bool>,
     },
-    /// For compatibility, `any` permits both text replies and tool calls.
+    /// Converted to the `auto` tool choice, so the model can answer with text or
+    /// call tools.
     Any {
         disable_parallel_tool_use: Option<bool>,
     },
@@ -159,34 +249,18 @@ pub enum MessagesToolChoice {
     None,
 }
 
+/// The `thinking` setting. When present, its `type` decides thinking mode
+/// before `output_config.effort` does.
 #[derive(Debug, Deserialize)]
 pub struct MessagesThinking {
-    #[serde(rename = "type")]
-    pub kind: MessagesThinkingType,
-    /// Thinking budget passed through for the caller to enforce.
+    pub r#type: ThinkingType,
+    /// Validated during deserialization and ignored by conversion.
     pub budget_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessagesThinkingType {
-    #[serde(alias = "adaptive")]
-    Enabled,
-    Disabled,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MessagesOutputConfig {
-    pub effort: Option<MessagesReasoningEffort>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessagesReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Ultra,
-    Max,
+    /// Requested reasoning effort. `none` disables thinking unless `thinking`
+    /// enables it.
+    pub effort: Option<RequestReasoningEffort>,
 }

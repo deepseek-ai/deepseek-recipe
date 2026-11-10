@@ -1,13 +1,15 @@
 """Smoke tests for the FastAPI example and its inference callback."""
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
 from deepseek_recipe import (
-    THINKING_END_TOKEN,
     ConversionOptions,
     InferenceChunk,
+    ModelVersion,
+    SpecialToken,
     WebSearchBehavior,
 )
 from fastapi.testclient import TestClient
@@ -71,12 +73,20 @@ def test_custom_inference():
         assert request.inference_options.temperature == 0.25
         assert request.images == []
         assert request.image_token_adjustment == 0
-        yield InferenceChunk.text(THINKING_END_TOKEN + "Custom answer")
+        yield InferenceChunk.text(SpecialToken.ThinkingEnd.default_str() + "Custom answer")
 
-    with TestClient(SERVER.create_app(infer)) as client:
+    options = SERVER.conversion_options().with_model_alias(
+        "custom-model", ModelVersion.DeepseekV41Flash
+    )
+    with TestClient(SERVER.create_app(infer, options=options)) as client:
         response = client.post(
             "/v1/responses",
-            json={"model": "custom-model", "input": "hi", "temperature": 0.25},
+            json={
+                "model": "custom-model",
+                "input": "hi",
+                "temperature": 0.25,
+                "reasoning": {"effort": "none"},
+            },
         )
     assert response.status_code == 200, response.text
     assert response.json()["model"] == "custom-model"
@@ -90,6 +100,25 @@ def test_invalid_request():
     assert response.headers["content-type"] == "application/json"
     assert "cache-control" not in response.headers
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_model_version_selects_the_prompt_encoding():
+    def body(model):
+        return json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"},
+            ],
+        }).encode()
+
+    system_token = SpecialToken.System.default_str()
+
+    # V4.1 writes the system token; V4 writes no system token.
+    v41 = SERVER.prepare_request("chat_completions", body("deepseek-flash"))
+    v4 = SERVER.prepare_request("chat_completions", body("deepseek-v4-pro"))
+    assert system_token in v41.prompt
+    assert system_token not in v4.prompt
 
 
 def test_web_search_conversion_options():
@@ -106,14 +135,15 @@ def test_web_search_conversion_options():
         "tools": [{"type": "web_search"}],
     }
 
-    # The default options reject Messages web search and ignore Responses web search.
+    # The default options reject Messages web search and drop Responses web search.
     with TestClient(SERVER.app) as client:
         assert client.post("/v1/messages", json=messages).status_code == 400
         assert client.post("/v1/responses", json=responses).status_code == 200
 
-    options = ConversionOptions(
-        responses_web_search=WebSearchBehavior.Reject,
-        messages_web_search=WebSearchBehavior.Ignore,
+    options = (
+        SERVER.conversion_options()
+        .with_responses_web_search(WebSearchBehavior.Reject)
+        .with_messages_web_search(WebSearchBehavior.Drop)
     )
     with TestClient(SERVER.create_app(options=options)) as client:
         accepted = client.post("/v1/messages", json=messages)

@@ -1,15 +1,15 @@
 # server-py
 
 A FastAPI example with Python mock inference. The server combines the Rust
-components exposed by `deepseek_recipe` for request conversion, prompt rendering,
-image resolution, and response processing. Request preparation and HTTP transport
-are implemented in [main.py](main.py).
+components exposed by `deepseek_recipe` for request conversion, prompt
+rendering, image resolution, and response processing. Request preparation and
+HTTP transport are implemented in [main.py](main.py).
 
 ## Usage
 
 Use Python 3.10+ in a virtual environment and install the
-[Rust and OpenCV prerequisites](../docs/development.md#native-dependencies). From the repository
-root:
+[Rust and OpenCV prerequisites](../docs/development.md#native-dependencies).
+From the repository root:
 
 ```sh
 python3 -m venv .venv
@@ -38,19 +38,35 @@ curl http://127.0.0.1:7777/v1/chat/completions \
 ```
 
 The response contains the mock answer `Hello world!`. Set `"stream":true` and
-add `-N` to curl to inspect SSE output. No API key or model weights are required.
+add `-N` to curl to inspect SSE output. No API key or model weights are
+required.
 
 ## Custom inference
 
-Use `create_app(infer=...)` in [main.py](main.py) to supply a backend. The callback
-receives the server's `PreparedRequest`, including the prompt, inference options,
-and processed images, and produces an asynchronous iterator of `InferenceChunk`
-values.
+Use `create_app(infer=...)` in [main.py](main.py) to supply a backend. The
+callback receives the server's `PreparedRequest`, including the rendered
+prompt, inference options, and processed images, and produces an asynchronous
+iterator of `InferenceChunk` values. The server's stream processor has no
+tokenizer, so the callback must produce `text` chunks: a `tokens` chunk fails
+the response, and usage does not count `reasoning_tokens`.
+`inference_options.max_tokens` is `None` when the request sets none; a backend
+that encodes the prompt resolves the value to send with
+`conversation_request.resolve_max_tokens(prompt_tokens, context_limit)`, where
+`prompt_tokens` adds `image_token_adjustment` to the encoded token count.
 
-Use `create_app(options=...)` to change the Rust conversion defaults. The default
-`ConversionOptions()` ignores Responses `web_search` declarations and rejects
-Messages `web_search` declarations; switching to the other value reverses that
-behavior (`Reject` for Responses and `Ignore` for Messages).
+Use `create_app(options=...)` to change the Rust conversion options, starting
+from `conversion_options()` in [main.py](main.py). `conversion_options()` drops
+Responses `web_search` declarations and rejects Messages `web_search`
+declarations; `with_responses_web_search(WebSearchBehavior.Reject)` and
+`with_messages_web_search(WebSearchBehavior.Drop)` reverse that behavior.
+Conversion resolves the model version from the request's
+model name through the options' `model_versions_by_name`, and rejects a request
+whose model is not listed. `conversion_options()` accepts the library default
+names `DeepSeek-V4-Pro` and `DeepSeek-V4.1-Flash` and the DeepSeek API names
+`deepseek-v4-pro` and `deepseek-flash`. The model version selects the prompt
+encoding: `ModelVersion.DeepseekV41Flash` renders prompts with
+`DeepseekV41Encoding`, and `ModelVersion.DeepseekV4Pro` renders them with
+`DeepseekV4Encoding`.
 
 ## Deployment scope
 

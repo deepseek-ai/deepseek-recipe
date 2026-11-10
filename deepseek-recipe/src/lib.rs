@@ -2,8 +2,10 @@
 //!
 //! [`request::ProtocolRequest::convert`] produces a shared
 //! [`request::ConversationRequest`]. [`stream::StreamProcessor`] parses backend
-//! output and passes it to the selected protocol's event generator. The caller
-//! supplies prompt rendering, token encoding, inference, usage, and transport.
+//! output, passes it to the selected protocol's chunk generator
+//! ([`stream::ChunkGenerator`]), and accumulates completion usage. The caller
+//! renders and encodes the prompt, supplies the backend and its prompt usage,
+//! and transports the protocol responses.
 
 pub use protocol::anthropic;
 pub use protocol::openai;
@@ -13,4 +15,3 @@ mod protocol;
 pub mod request;
 pub mod response;
 pub mod stream;
-pub mod util;

@@ -1,9 +1,9 @@
-//! Image input types and DeepSeek V4.1 image token accounting.
+//! Image input types and DeepSeek V4.1 image token counts.
 //!
-//! A caller supplies images as [`ImageSource`] values. Resolving an image source
-//! produces an [`ImageInfo`] carrying the bytes sent to the inference backend.
-//! Every image contributes one [`IMAGE_SPECIAL_TOKEN`] placeholder to the prompt
-//! text, in the order the images appear in the conversation.
+//! A caller supplies images as [`ImageSource`] values. Resolving an image
+//! source produces an [`ImageInfo`] that holds the encoded image bytes sent to
+//! the backend. The prompt holds one placeholder for each image, in the order
+//! the images appear in the conversation.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,15 +11,22 @@ pub mod token_spec;
 
 pub use token_spec::{CalcResizeError, ImageTokenSpec, ResizeResult};
 
-/// Placeholder written into the prompt for every image.
-pub const IMAGE_SPECIAL_TOKEN: &str = "<｜image｜>";
-
-/// Token ID that the V4.1 tokenizer assigns to [`IMAGE_SPECIAL_TOKEN`]. A caller
-/// that encodes the prompt into token IDs can compare against this ID.
+/// Token ID of the image token in the V4.1 tokenizer. Overriding
+/// [`SpecialToken::Image`] changes the image token's spelling but not this ID.
+///
+/// [`SpecialToken::Image`]: crate::special_tokens::SpecialToken::Image
 pub const IMAGE_SPECIAL_TOKEN_ID: u32 = 129264;
 
 /// Maximum UTF-8 byte length of an external image URL during conversion.
 pub const MAX_IMAGE_URL_LEN: usize = 8192;
+
+/// Error message for an image whose bytes are missing, undecodable, or of an
+/// unsupported format. Conversion reports it for a data URL with an
+/// unsupported media type, and image resolution reports it, prefixed with the
+/// image's request location, for an image that cannot be preprocessed.
+pub const UNSUPPORTED_IMAGE_ERROR_MESSAGE: &str = "You have uploaded an unsupported image. \
+    Please make sure your image is valid and has one of the following formats: webp, png, \
+    jpeg, and gif.";
 
 /// Media type accepted for image input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +38,7 @@ pub enum ImageMediaType {
 }
 
 impl ImageMediaType {
-    /// Return the media type of this image media type.
+    /// Return the MIME type string, such as `image/png`.
     pub const fn mime(self) -> &'static str {
         match self {
             Self::Jpeg => "image/jpeg",
@@ -41,8 +48,8 @@ impl ImageMediaType {
         }
     }
 
-    /// Resolve a media type string. Parameters after `;` are ignored, matching
-    /// is case-insensitive, and `image/jpg` is accepted as an alias of
+    /// Parse a MIME type string. Parameters after `;` are ignored, matching is
+    /// case-insensitive, and `image/jpg` is accepted as an alias of
     /// `image/jpeg`. Returns `None` for an unsupported media type.
     pub fn from_mime(mime: &str) -> Option<Self> {
         let mime = mime.split(';').next().unwrap_or_default().trim();
@@ -68,9 +75,11 @@ impl ImageMediaType {
 
 /// Requested image detail level.
 ///
-/// The OpenCV preprocessor applies an additional long-side limit for
-/// [`Low`](Self::Low) before fitting the token budget. All levels still undergo
-/// token-budget fitting and WebP encoding, which can resize the image.
+/// The OpenCV preprocessor processes [`High`](Self::High),
+/// [`Original`](Self::Original), and [`Auto`](Self::Auto) identically; only
+/// [`Low`](Self::Low) applies an additional long-side limit before token-budget
+/// fitting. Token-budget fitting, which can resize the image, and WebP
+/// encoding apply to every level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageDetail {
@@ -89,18 +98,37 @@ impl ImageDetail {
 }
 
 /// One image supplied with a conversation, before resolution.
+///
+/// Every variant records the `path` of the image: its request location as
+/// error messages report it, such as `messages.0.content[1]`. Conversion fills
+/// the path of each image source with the location of the message or block
+/// that supplied the image; image resolution prefixes its errors with it. A
+/// caller that constructs a source outside protocol conversion leaves the path
+/// empty, and resolution errors then carry no location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSource {
     /// Data URL with a base64 or percent-encoded body.
     DataUrl {
         data_url: String,
         detail: ImageDetail,
+        /// Request location of the image; empty when unknown.
+        path: String,
     },
     /// External image URL. Conversion and resolution check the case-insensitive
     /// `http` prefix; the fetcher is responsible for validating the full URL.
-    Url { url: String, detail: ImageDetail },
+    Url {
+        url: String,
+        detail: ImageDetail,
+        /// Request location of the image; empty when unknown.
+        path: String,
+    },
     /// Encoded image bytes supplied by the caller.
-    Bytes { data: Vec<u8>, detail: ImageDetail },
+    Bytes {
+        data: Vec<u8>,
+        detail: ImageDetail,
+        /// Request location of the image; empty when unknown.
+        path: String,
+    },
 }
 
 impl ImageSource {
@@ -110,6 +138,14 @@ impl ImageSource {
             Self::DataUrl { detail, .. }
             | Self::Url { detail, .. }
             | Self::Bytes { detail, .. } => *detail,
+        }
+    }
+
+    /// Return the request location of the image as error messages report it,
+    /// or an empty string when the source was constructed without one.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::DataUrl { path, .. } | Self::Url { path, .. } | Self::Bytes { path, .. } => path,
         }
     }
 }
@@ -148,21 +184,21 @@ impl MultiModalData {
         self.images.is_empty()
     }
 
-    /// Return the number of prompt tokens beyond one per placeholder.
+    /// Return the number of inference input tokens beyond one per
+    /// placeholder, using the V4.1 image token specification.
     ///
-    /// Every image contributes one placeholder token to the prompt and
-    /// [`ImageTokenSpec::calc_token_len`] tokens to the inference input. The
-    /// adjustment is the difference over all images.
+    /// Every image contributes one placeholder to the prompt and its image
+    /// token count, [`ImageTokenSpec::calc_token_count`], to the inference input.
+    /// The adjustment is the sum of the differences over all images.
     ///
     /// # Errors
     ///
-    /// Returns [`CalcResizeError`] when the token length of an image does not
-    /// converge.
+    /// Returns [`CalcResizeError`] when fitting an image does not converge.
     pub fn image_token_adjustment(&self) -> Result<usize, CalcResizeError> {
         let spec = ImageTokenSpec::v41();
         let mut adjustment = 0usize;
         for image in &self.images {
-            adjustment += spec.calc_token_len(image.width as usize, image.height as usize)? - 1;
+            adjustment += spec.calc_token_count(image.width as usize, image.height as usize)? - 1;
         }
         Ok(adjustment)
     }
@@ -189,8 +225,9 @@ mod tests {
                 },
             ],
         };
-        let expected =
-            spec.calc_token_len(1920, 1080).unwrap() + spec.calc_token_len(640, 480).unwrap() - 2;
+        let expected = spec.calc_token_count(1920, 1080).unwrap()
+            + spec.calc_token_count(640, 480).unwrap()
+            - 2;
         assert_eq!(data.image_token_adjustment().unwrap(), expected);
         assert!(MultiModalData::default().image_token_adjustment().unwrap() == 0);
     }

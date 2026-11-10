@@ -8,10 +8,11 @@
 
 deepseek-recipe is a collection of Rust libraries and Python bindings that
 uniformly convert API requests in different formats into the Conversation
-format, encode them into prompts for DeepSeek models, and convert model output
-into responses in the corresponding format. Use these components to connect an
-inference backend to API services that support multiple formats. Model
-inference, tool execution, and HTTP transport must be provided externally.
+format, render conversations into prompts for DeepSeek models, encode
+conversations into token IDs with an attached tokenizer, and convert model
+output into responses in the corresponding format. Use these components to
+connect an inference backend to API services that support multiple formats. The
+caller must provide model inference, tool execution, and HTTP transport.
 
 ### Papers with Code results
 
@@ -22,37 +23,58 @@ inference, tool execution, and HTTP transport must be provided externally.
 [![Papers with Code: #2 on BabyVision](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29244&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29244)
 [![Papers with Code: #2 on ProgramBench](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge.svg?eval=29239&live=1)](https://paperswithcode.co/api/v1/papers/114097/leaderboard-badge-link?eval=29239)
 
-[Getting started](#using-deepseek-recipe) · [Streaming response](docs/streaming.md) ·
+[Getting started](#using-deepseek-recipe) ·
+[Streaming response](docs/streaming.md) ·
 [Use with tokenizer](docs/tokenizer.md) · [License](#license)
 
 ## Supported scope
 
 - **Request/response formats:** Conversion of Messages, Chat Completions, and
   Responses requests, [Streaming response](docs/streaming.md), and complete
-  responses. Supports text, images, thinking, and client tool calls.
-- **Prompts:** Encoding of DeepSeek V4 and V4.1 conversations into prompts or token IDs.
-- **Generation settings:** Thinking mode, reasoning effort, `temperature`, `top_p`,
-  and output token limits.
-- **Output parsing:** Thinking, tool calls, JSON object output, and stop sequences.
-- **Images:** Provided as base64 or external URLs. The image component provides
-  DeepSeek V4.1 preprocessing with OpenCV.
-- **Tool definitions:** Function tools; the Responses API also supports tool
-  namespaces and the `apply_patch` custom tool.
-
-## Not yet supported
-
-- Token probabilities (`logprobs` and `top_logprobs`).
-- Document content, audio/video input, and file retrieval by `file_id`.
-- Server tool execution, such as `web_search`.
-- JSON Schema and regex output constraints, or enforcement of tool `strict` settings.
-- Multiple completions per Chat Completions request (`n > 1`).
-- Responses custom tool definitions other than `apply_patch`.
-- Responses conversation storage and context retrieval through `previous_response_id`.
-- Responses encrypted thinking content (`encrypted_content`).
+  responses. Supports text, images, thinking mode, client tool calls, and Chat
+  Completions `prefix` continuation.
+- **Prompts:** Rendering of DeepSeek V4 and V4.1 conversations into prompts, and
+  encoding of conversations into token IDs with an attached tokenizer.
+- **Generation settings:** Thinking mode, reasoning effort, `temperature`,
+  `top_p`, and output token limits. After the caller encodes the prompt,
+  `ConversationRequest::resolve_max_tokens` checks the prompt and `max_tokens`
+  against the context limit and supplies the `max_tokens` default when the
+  request sets none: 8192 outside thinking mode, 65536 in thinking mode, and
+  131072 in thinking mode with `max` effort.
+- **Output parsing:** Reasoning content, tool calls, JSON object output, and
+  stop sequences. Usage reports `reasoning_tokens` when the stream processor has an
+  attached tokenizer: the processor encodes the reasoning content with it to
+  count the tokens.
+- **Structured output:** Chat Completions `response_format` of type
+  `json_schema` or `regex`, and Responses `text.format` of type `json_schema`.
+  Conversion validates a JSON Schema, and rendering writes it into the prompt; a
+  regex is passed through as `ResponseFormat::Regex`. Conversion also selects
+  the `OutputConstraint` of `InferenceOptions`: the tool call block of a request
+  with tools and a tool choice other than `none`, otherwise the JSON, JSON
+  Schema, or regex of its response format. The caller decides whether its
+  backend enforces it by constrained decoding.
+- **Images:** Provided as base64 or external URLs, and preprocessed for
+  DeepSeek V4.1 with OpenCV by the image component. DeepSeek V4 does not
+  accept images; conversion replaces each image in a V4 request with the text
+  `[Unsupported Image]`. The component's `ReqwestImageFetcher`
+  connects to any address by default, so a service that fetches URLs from
+  untrusted requests should install a `DestinationFilter`.
+- **Tool definitions:** Function tools, and for Responses also tool namespaces
+  and the `apply_patch` custom tool. V4.1 supports deferred tool loading in
+  Messages and client-executed tool search in Responses.
+- **Log probabilities:** `logprobs` and `top_logprobs` (Chat Completions) and
+  `top_logprobs` (Responses) are converted into `InferenceOptions`. The caller
+  supplies the backend's values in `InferenceChunk::Tokens`; with an attached
+  tokenizer, the Chat Completions and Responses adapters report them. The
+  library does not compute probabilities.
 
 ## Using deepseek-recipe
 
-To convert a Chat Completions request into a DeepSeek V4.1 prompt:
+The examples below convert a Chat Completions request into a DeepSeek V4.1
+prompt. The library resolves the model version from the request's `model` name
+and accepts `DeepSeek-V4-Pro` and `DeepSeek-V4.1-Flash` by default; register
+other names, such as `deepseek-flash`, with
+`ConversionOptions::with_model_alias`.
 
 ### Python
 
@@ -70,7 +92,7 @@ python3 -m pip install deepseek-recipe
 from deepseek_recipe import ChatCompletionRequest, ConversionOptions, DeepseekV41Encoding
 
 request = ChatCompletionRequest({
-    "model": "deepseek-flash",
+    "model": "DeepSeek-V4.1-Flash",
     "messages": [{"role": "user", "content": "Hello"}],
 })
 converted = request.convert(ConversionOptions())
@@ -83,10 +105,11 @@ print(rendered.prompt)
 #### Installation
 
 ```sh
-cargo add deepseek-recipe@0.1 deepseek-recipe-encoding@0.1
+cargo add deepseek-recipe@0.2 deepseek-recipe-encoding@0.2 serde_json@1
 ```
 
-See the [development guide](docs/development.md) for source builds and image dependencies.
+See the [development guide](docs/development.md) for source builds and image
+dependencies.
 
 #### Example
 
@@ -99,7 +122,7 @@ use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "deepseek-flash",
+        "model": "DeepSeek-V4.1-Flash",
         "messages": [{"role": "user", "content": "Hello"}],
     }))?;
     let converted = request.convert(ConversionOptions::default())?;
@@ -111,7 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Encoding & Decoding Demo
 
-Run the encoding and decoding demo from the repository root:
+Run the demo from the repository root to render prompts from requests and parse
+model output into protocol responses:
 
 ```sh
 cargo run -p encoding-decoding-demo --locked
@@ -134,12 +158,14 @@ token IDs or decode backend token IDs, see
 | [`deepseek-recipe-core`](https://docs.rs/deepseek-recipe-core) | Shared conversation, message, image, and tool types. |
 | [`deepseek-recipe-encoding`](https://docs.rs/deepseek-recipe-encoding) | DeepSeek V4 and V4.1 prompt rendering and token encoding. |
 | [`deepseek-recipe-image`](https://docs.rs/deepseek-recipe-image) | Image fetching and preprocessing. |
+| [`deepseek-recipe-macros`](https://docs.rs/deepseek-recipe-macros) | The `prompt!` macro used by prompt rendering. |
 | [`deepseek-recipe-python`](deepseek-recipe-python/README.md) | Python bindings, imported as `deepseek_recipe`. |
-| [encoding-decoding-demo](encoding-decoding-demo/README.md) | A web interface for encoding prompts, inspecting special tokens, and decoding complete model output into Chat Completions, Responses, or Messages. |
+| [encoding-decoding-demo](encoding-decoding-demo/README.md) | A web interface that renders prompts, highlights special tokens, and parses complete model output into Chat Completions, Responses, or Messages responses. |
 | [server-rs](server-rs/README.md) | An Axum API example with mock inference. |
 | [server-py](server-py/README.md) | A FastAPI example with mock inference. |
 
 ## License
 
-Project code and public documentation are licensed under the [MIT License](LICENSE).
-Bundled tokenizer notices are in [static/tokenizers/README.md](static/tokenizers/README.md).
+Project code and public documentation are licensed under the
+[MIT License](LICENSE). Bundled tokenizer notices are in
+[static/tokenizers/README.md](static/tokenizers/README.md).

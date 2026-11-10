@@ -5,13 +5,15 @@
 `StreamProcessor` converts backend output into Messages, Chat Completions, or
 Responses events. The examples below use mock inference and print Chat
 Completions chunks. The application supplies the backend and HTTP transport.
+In thinking mode, the processor counts `reasoning_tokens` for usage only when a
+tokenizer is attached; see [Use with tokenizer](tokenizer.md#decoding).
 
 ## Rust
 
 Add the dependencies to your application:
 
 ```sh
-cargo add deepseek-recipe@0.1 serde_json@1 tokio-stream@0.1
+cargo add deepseek-recipe@0.2 serde_json@1 tokio-stream@0.1
 cargo add tokio@1 --features macros,rt-multi-thread
 ```
 
@@ -29,7 +31,7 @@ use tokio_stream::{StreamExt, iter};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let body = json!({
-        "model": "deepseek-flash",
+        "model": "DeepSeek-V4.1-Flash",
         "messages": [{"role": "user", "content": "Hello"}],
         "thinking": {"type": "disabled"},
     });
@@ -37,8 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The chunk generator uses the converted request's resolved settings.
     let request: ChatCompletionRequest = serde_json::from_value(body)?;
     let converted = request.convert(ConversionOptions::default())?;
-    let generator =
-        ChatCompletionRequest::chunk_generator(&converted, "id-1".into(), "deepseek-flash".into());
+    let generator = ChatCompletionRequest::chunk_generator(
+        &converted,
+        "id-1".into(),
+        "DeepSeek-V4.1-Flash".into(),
+    );
     let processor = StreamProcessor::new(generator, converted.parsing_options);
 
     // Mock the backend's inference chunks.
@@ -52,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         InferenceChunk::Text {
             content: "Hello!".into(),
-            content_tokens: 2,
+            token_count: 2,
         },
         InferenceChunk::Finish {
             finish_reason: InferenceFinishReason::Stop,
@@ -60,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     // Convert them into protocol chunks.
-    let mut chunks = std::pin::pin!(processor.process(inference));
+    let mut chunks = std::pin::pin!(processor.into_protocol_stream(inference));
     while let Some(chunk) = chunks.next().await {
         println!("{}", serde_json::to_string(&chunk?)?);
     }
@@ -84,19 +89,19 @@ from deepseek_recipe import (
 )
 
 request = ChatCompletionRequest({
-    "model": "deepseek-flash",
+    "model": "DeepSeek-V4.1-Flash",
     "messages": [{"role": "user", "content": "Hello"}],
     "thinking": {"type": "disabled"},
 })
 converted = request.convert(ConversionOptions())
-generator = ChatCompletionRequest.chunk_generator(converted, "id-1", "deepseek-flash")
+generator = ChatCompletionRequest.chunk_generator(converted, "id-1", "DeepSeek-V4.1-Flash")
 processor = StreamProcessor(generator, converted.parsing_options)
 
 # Mock the backend's inference chunks.
 chunks = []
 for chunk in [
     InferenceChunk.ready(system_fingerprint="fp-1", prompt_usage=PromptUsage(prompt_tokens=4)),
-    InferenceChunk.text("Hello!", content_tokens=2),
+    InferenceChunk.text("Hello!", token_count=2),
     InferenceChunk.finish(InferenceFinishReason.Stop),
 ]:
     chunks.extend(processor.push(chunk))

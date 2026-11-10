@@ -1,8 +1,8 @@
 use serde::Serialize;
 
+use crate::response::Accumulate;
 use crate::response::ProtocolResponse;
-use crate::stream::{CompletionUsage, FinishReason, PromptUsage};
-use crate::util::append_delta::AppendDelta;
+use crate::stream::{CompletionUsage, FinishReason, PromptUsage, TokenLogprob};
 
 use super::chunk_generator::ChatCompletionChunkGenerator;
 
@@ -18,10 +18,10 @@ pub struct ChatCompletionResponse {
     pub object: &'static str,
     pub created: u64,
     pub model: String,
-    pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatCompletionChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ChatCompletionUsage>,
+    pub system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,7 +60,15 @@ pub struct ChatCompletionResponseMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ChatCompletionResponseToolCall>>,
+    pub tool_calls: Option<Vec<ChatCompletionIndexedToolCall>>,
+}
+
+/// A tool call in an accumulated assistant message, with its position.
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionIndexedToolCall {
+    pub index: u32,
+    #[serde(flatten)]
+    pub call: ChatCompletionResponseToolCall,
 }
 
 /// An incremental update to an assistant message.
@@ -129,9 +137,7 @@ pub enum ChatCompletionFinishReason {
     Stop,
     Length,
     ContentFilter,
-    InsufficientSystemResource,
     ToolCalls,
-    Aborted,
 }
 
 impl From<FinishReason> for ChatCompletionFinishReason {
@@ -147,7 +153,7 @@ impl From<FinishReason> for ChatCompletionFinishReason {
     }
 }
 
-/// Log probabilities are not supplied by the current inference contract.
+/// Log probabilities of answer content and reasoning content tokens.
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionLogprobs {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,10 +162,10 @@ pub struct ChatCompletionLogprobs {
     pub reasoning_content: Option<Vec<ChatCompletionTokenLogprob>>,
 }
 
-impl AppendDelta<ChatCompletionLogprobs> for ChatCompletionLogprobs {
-    fn append(&mut self, delta: ChatCompletionLogprobs) {
-        self.content.append(delta.content);
-        self.reasoning_content.append(delta.reasoning_content);
+impl Accumulate<ChatCompletionLogprobs> for ChatCompletionLogprobs {
+    fn accumulate(&mut self, delta: ChatCompletionLogprobs) {
+        self.content.accumulate(delta.content);
+        self.reasoning_content.accumulate(delta.reasoning_content);
     }
 }
 
@@ -176,6 +182,25 @@ pub struct ChatCompletionTopLogprob {
     pub token: String,
     pub logprob: f32,
     pub bytes: Option<Vec<u8>>,
+}
+
+impl From<&TokenLogprob> for ChatCompletionTokenLogprob {
+    fn from(logprob: &TokenLogprob) -> Self {
+        Self {
+            token: logprob.token.clone(),
+            logprob: logprob.logprob,
+            bytes: Some(logprob.bytes.clone()),
+            top_logprobs: logprob
+                .top_logprobs
+                .iter()
+                .map(|top_logprob| ChatCompletionTopLogprob {
+                    token: top_logprob.token.clone(),
+                    logprob: top_logprob.logprob,
+                    bytes: Some(top_logprob.bytes.clone()),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -209,7 +234,9 @@ impl From<(PromptUsage, CompletionUsage)> for ChatCompletionUsage {
             prompt_tokens_details: ChatCompletionInputTokenUsage {
                 cached_tokens: prompt.prompt_cache_hit_tokens,
             },
-            completion_tokens_details: None,
+            completion_tokens_details: completion
+                .reasoning_tokens
+                .map(|reasoning_tokens| ChatCompletionOutputTokenUsage { reasoning_tokens }),
             prompt_cache_hit_tokens: prompt.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens: prompt
                 .prompt_tokens
@@ -233,19 +260,19 @@ impl ProtocolResponse for ChatCompletionResponse {
             object: CHAT_COMPLETION_OBJECT,
             created,
             model,
-            system_fingerprint: None,
             choices: vec![],
             usage: None,
+            system_fingerprint: None,
         }
     }
 
-    fn done_message() -> Option<String> {
+    fn sse_done_data() -> Option<String> {
         Some("[DONE]".to_string())
     }
 }
 
-impl AppendDelta<ChatCompletionChunk> for ChatCompletionResponse {
-    fn append(&mut self, chunk: ChatCompletionChunk) {
+impl Accumulate<ChatCompletionChunk> for ChatCompletionResponse {
+    fn accumulate(&mut self, chunk: ChatCompletionChunk) {
         if let Some(Some(usage)) = chunk.usage {
             self.usage = Some(usage);
         }
@@ -275,8 +302,8 @@ impl AppendDelta<ChatCompletionChunk> for ChatCompletionResponse {
                     self.choices.last_mut().expect("the choice was inserted")
                 }
             };
-            choice.message.append(chunk_choice.delta);
-            choice.logprobs.append(chunk_choice.logprobs);
+            choice.message.accumulate(chunk_choice.delta);
+            choice.logprobs.accumulate(chunk_choice.logprobs);
             if chunk_choice.finish_reason.is_some() {
                 choice.finish_reason = chunk_choice.finish_reason;
             }
@@ -284,22 +311,31 @@ impl AppendDelta<ChatCompletionChunk> for ChatCompletionResponse {
     }
 }
 
-impl AppendDelta<ChatCompletionMessageDelta> for ChatCompletionResponseMessage {
-    fn append(&mut self, delta: ChatCompletionMessageDelta) {
+impl Accumulate<ChatCompletionMessageDelta> for ChatCompletionResponseMessage {
+    fn accumulate(&mut self, delta: ChatCompletionMessageDelta) {
         if let Some(role) = delta.role {
             self.role = role;
         }
-        self.content.append(delta.content.flatten());
+        self.content.accumulate(delta.content.flatten());
         self.reasoning_content
-            .append(delta.reasoning_content.flatten());
+            .accumulate(delta.reasoning_content.flatten());
         if let Some(tool_deltas) = delta.tool_calls {
             let tool_calls = self.tool_calls.get_or_insert_with(Vec::new);
             for tool_delta in tool_deltas {
                 match tool_delta {
-                    ChatCompletionToolCallDelta::Start { call, .. } => tool_calls.push(call),
+                    ChatCompletionToolCallDelta::Start { index, call } => {
+                        tool_calls.push(ChatCompletionIndexedToolCall { index, call });
+                    }
                     ChatCompletionToolCallDelta::Arguments { index, function } => {
-                        if let Some(call) = tool_calls.get_mut(index as usize) {
-                            call.function.arguments.push_str(&function.arguments);
+                        if let Some(tool_call) = tool_calls
+                            .iter_mut()
+                            .find(|tool_call| tool_call.index == index)
+                        {
+                            tool_call
+                                .call
+                                .function
+                                .arguments
+                                .push_str(&function.arguments);
                         }
                     }
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-recipe-encoding"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Conversation rendering and token encoding for DeepSeek V4 and V4.1 prompts."
 readme.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aho-corasick = { workspace = true }
 deepseek-recipe-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

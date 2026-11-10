@@ -1,14 +1,16 @@
 //! Python bindings for image fetching, preprocessing, and token accounting.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use deepseek_recipe_core::multimodal::{ImageInfo, MultiModalData};
 use deepseek_recipe_image::{
-    ImageByteBudget, ImageError as RustImageError, ImageFetcher, ImagePreprocessor, ImageQuota,
-    ImageResolver, OpenCvImagePreprocessor, PreprocessOptions, ReqwestImageFetcher,
+    DestinationFilter, ImageByteBudget, ImageError as RustImageError, ImageFetcher,
+    ImagePreprocessor, ImageQuota, ImageResolver, OpenCvImagePreprocessor, PreprocessOptions,
+    ReqwestImageFetcher,
 };
-use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -18,7 +20,11 @@ pyo3::create_exception!(
     _native,
     ImageError,
     PyException,
-    "An image fetching, decoding, or preprocessing failure."
+    "A failure to resolve, fetch, or preprocess images, including request limits. \
+     `kind` names the Rust error variant, `is_retryable` reports whether another \
+     attempt might succeed, and the message is the text of a 400 response body: \
+     the request location of the image, such as `messages.0.content[1].image[0]`, \
+     followed by the failure."
 );
 
 pyo3::create_exception!(
@@ -37,18 +43,19 @@ fn image_error(py: Python<'_>, error: RustImageError) -> PyErr {
         RustImageError::TooManyImages { .. } => "TooManyImages",
         RustImageError::ImageTooLarge { .. } => "ImageTooLarge",
         RustImageError::TotalSizeTooLarge { .. } => "TotalSizeTooLarge",
-        RustImageError::InvalidDataUrl(_) => "InvalidDataUrl",
-        RustImageError::EmptyImage => "EmptyImage",
-        RustImageError::UnsupportedMediaType(_) => "UnsupportedMediaType",
-        RustImageError::ImageDimensionsTooLarge => "ImageDimensionsTooLarge",
-        RustImageError::Decode(_) => "Decode",
-        RustImageError::Resize(_) => "Resize",
-        RustImageError::Encode(_) => "Encode",
+        RustImageError::InvalidDataUrl { .. } => "InvalidDataUrl",
+        RustImageError::EmptyImage { .. } => "EmptyImage",
+        RustImageError::UnsupportedMediaType { .. } => "UnsupportedMediaType",
+        RustImageError::ImageDimensionsTooLarge { .. } => "ImageDimensionsTooLarge",
+        RustImageError::Decode { .. } => "Decode",
+        RustImageError::Resize { .. } => "Resize",
+        RustImageError::Encode { .. } => "Encode",
         RustImageError::TokenBudget(_) => "TokenBudget",
         RustImageError::Fetch { .. } => "Fetch",
         RustImageError::FetchStatus { .. } => "FetchStatus",
+        RustImageError::DestinationRejected { .. } => "DestinationRejected",
         RustImageError::Client(_) => "Client",
-        RustImageError::EncodeFailed => "EncodeFailed",
+        RustImageError::EncodeFailed { .. } => "EncodeFailed",
     };
     let exception = ImageError::new_err(error.to_string());
     let value = exception.value(py);
@@ -77,7 +84,8 @@ fn run_image_operation<T: Send>(
     result.map_err(|error| image_error(py, error))
 }
 
-/// Encoded image bytes and their dimensions in pixels.
+/// A preprocessed image for the inference backend: its encoded bytes and its
+/// dimensions in pixels.
 #[pyclass(name = "ImageInfo", module = "deepseek_recipe._native", frozen)]
 pub(crate) struct PyImageInfo {
     inner: ImageInfo,
@@ -102,13 +110,13 @@ impl PyImageInfo {
         PyBytes::new(py, &self.inner.data).unbind()
     }
 
-    /// Image width in pixels.
+    /// Image width in pixels after preprocessing.
     #[getter]
     fn width(&self) -> u32 {
         self.inner.width
     }
 
-    /// Image height in pixels.
+    /// Image height in pixels after preprocessing.
     #[getter]
     fn height(&self) -> u32 {
         self.inner.height
@@ -154,7 +162,13 @@ impl PyMultiModalData {
         self.inner.is_empty()
     }
 
-    /// Return the number of prompt tokens beyond one per image placeholder.
+    /// Return the number of inference input tokens beyond one per placeholder,
+    /// using the V4.1 image token specification.
+    ///
+    /// Each image occupies one placeholder in the prompt and its image token
+    /// count in the inference input; the adjustment is the sum of the
+    /// differences. Raises `CalcResizeError` when fitting an image does not
+    /// converge.
     fn image_token_adjustment(&self) -> PyResult<usize> {
         self.inner
             .image_token_adjustment()
@@ -162,9 +176,12 @@ impl PyMultiModalData {
     }
 }
 
-/// Image count and encoded size accumulated across resolve calls.
-/// A call records its sources after preprocessing all of them, so a failed call
-/// adds nothing.
+/// The image count and encoded bytes recorded by the completed resolve calls of
+/// one request.
+///
+/// To apply the image count and total byte limits across the resolve calls of
+/// a request, the caller must pass the same quota to every call. A call records
+/// its sources after preprocessing all of them, so a failed call adds nothing.
 #[pyclass(name = "ImageQuota", module = "deepseek_recipe._native")]
 pub(crate) struct PyImageQuota {
     inner: ImageQuota,
@@ -184,7 +201,7 @@ impl PyImageQuota {
         self.inner.image_count()
     }
 
-    /// Return the encoded source bytes recorded by the completed calls.
+    /// Return the number of encoded bytes recorded by the completed calls.
     fn byte_size(&self) -> usize {
         self.inner.byte_size()
     }
@@ -225,14 +242,47 @@ impl PyPreprocessOptions {
         self.inner.max_dimension_px
     }
 
-    /// Maximum long side before token-budget fitting at low detail.
+    /// Maximum long side in pixels at low detail, applied before token-budget
+    /// fitting.
     #[getter]
     fn low_detail_max_dimension_px(&self) -> u32 {
         self.inner.low_detail_max_dimension_px
     }
 }
 
-/// Fetches external image URLs through the Rust HTTP client.
+/// A destination filter that calls a Python callable with the host and the
+/// address.
+///
+/// A callable that raises or returns a non-boolean value rejects the address;
+/// the exception is reported as unraisable.
+struct CallableDestinationFilter {
+    callable: Py<PyAny>,
+}
+
+impl DestinationFilter for CallableDestinationFilter {
+    fn allows(&self, host: &str, address: IpAddr) -> bool {
+        Python::attach(|py| {
+            match self
+                .callable
+                .call1(py, (host, address.to_string()))
+                .and_then(|allowed| allowed.extract::<bool>(py))
+            {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    error.write_unraisable(py, Some(self.callable.bind(py)));
+                    false
+                }
+            }
+        })
+    }
+}
+
+/// An image fetcher that downloads external image URLs through the Rust
+/// `reqwest` client.
+///
+/// Without a destination filter, this fetcher connects to any address. When
+/// untrusted clients can supply image URLs, the caller should install a filter
+/// with `with_destination_filter` to protect against SSRF.
 #[derive(Clone)]
 #[pyclass(
     name = "ReqwestImageFetcher",
@@ -255,7 +305,8 @@ impl ImageFetcher for PyReqwestImageFetcher {
 
 #[pymethods]
 impl PyReqwestImageFetcher {
-    /// Construct the Rust fetcher with its default image size limit.
+    /// Construct the Rust fetcher with its default image size limit. Raises
+    /// `ImageError` when the HTTP client cannot be constructed.
     #[new]
     fn new(py: Python<'_>) -> PyResult<Self> {
         ReqwestImageFetcher::new()
@@ -265,10 +316,44 @@ impl PyReqwestImageFetcher {
             .map_err(|error| image_error(py, error))
     }
 
-    /// Construct the Rust fetcher with an explicit encoded size limit.
+    /// Construct the Rust fetcher with an explicit encoded size limit in
+    /// bytes. Raises `ImageError` when the HTTP client cannot be constructed.
     #[staticmethod]
     fn with_max_bytes(py: Python<'_>, max_bytes: usize) -> PyResult<Self> {
         ReqwestImageFetcher::with_max_bytes(max_bytes)
+            .map(|inner| Self {
+                inner: Arc::new(inner),
+            })
+            .map_err(|error| image_error(py, error))
+    }
+
+    /// Return a fetcher with this fetcher's size limit that connects only to
+    /// the addresses `destination_filter` allows.
+    ///
+    /// `destination_filter(host, address)` receives the host of the image URL
+    /// or of a redirect target and one address as a string, such as
+    /// `"10.0.0.1"`, and returns whether the fetcher can connect to it. For a
+    /// host name, the fetcher connects only to the resolved addresses that the
+    /// filter allows. A host with no allowed address raises `ImageError` with
+    /// kind `DestinationRejected`. The returned fetcher uses no proxy, because
+    /// a proxy resolves the target host itself. The library does not include a
+    /// filter implementation; the caller writes the rule. Raises `TypeError`
+    /// when `destination_filter` is not callable and `ImageError` when the
+    /// HTTP client cannot be constructed.
+    fn with_destination_filter(
+        &self,
+        py: Python<'_>,
+        destination_filter: Py<PyAny>,
+    ) -> PyResult<Self> {
+        if !destination_filter.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("destination_filter must be callable"));
+        }
+        ReqwestImageFetcher::with_max_bytes(self.inner.max_bytes())
+            .and_then(|fetcher| {
+                fetcher.with_destination_filter(CallableDestinationFilter {
+                    callable: destination_filter,
+                })
+            })
             .map(|inner| Self {
                 inner: Arc::new(inner),
             })
@@ -286,7 +371,7 @@ impl PyReqwestImageFetcher {
     }
 }
 
-/// Preprocesses encoded images through the Rust OpenCV implementation.
+/// An image preprocessor that uses the Rust OpenCV implementation.
 #[pyclass(
     name = "OpenCvImagePreprocessor",
     module = "deepseek_recipe._native",
@@ -317,7 +402,7 @@ impl PyOpenCvImagePreprocessor {
     }
 }
 
-/// Resolves image sources using explicit fetching and preprocessing components.
+/// An image resolver built from explicit fetching and preprocessing components.
 #[pyclass(name = "ImageResolver", module = "deepseek_recipe._native", frozen)]
 pub(crate) struct PyImageResolver {
     inner: ImageResolver<PyReqwestImageFetcher, OpenCvImagePreprocessor>,

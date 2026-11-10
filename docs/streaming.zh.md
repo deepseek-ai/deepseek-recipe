@@ -2,14 +2,14 @@
 
 [English](streaming.md) | **中文**
 
-`StreamProcessor` 把后端输出转换为 Messages、Chat Completions 或 Responses 事件。以下示例使用 mock 推理并打印 Chat Completions chunk。后端与 HTTP 传输由应用提供。
+`StreamProcessor` 把后端输出转换为 Messages、Chat Completions 或 Responses 事件。以下示例使用 mock 推理并打印 Chat Completions chunk。后端与 HTTP 传输由应用提供。思考模式下，只有为 processor 附加 tokenizer 后，它才会统计 usage 中的 `reasoning_tokens`，见[使用 tokenizer](tokenizer.zh.md#解码)。
 
 ## Rust
 
 为你的应用添加依赖：
 
 ```sh
-cargo add deepseek-recipe@0.1 serde_json@1 tokio-stream@0.1
+cargo add deepseek-recipe@0.2 serde_json@1 tokio-stream@0.1
 cargo add tokio@1 --features macros,rt-multi-thread
 ```
 
@@ -27,7 +27,7 @@ use tokio_stream::{StreamExt, iter};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let body = json!({
-        "model": "deepseek-flash",
+        "model": "DeepSeek-V4.1-Flash",
         "messages": [{"role": "user", "content": "Hello"}],
         "thinking": {"type": "disabled"},
     });
@@ -35,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // chunk 生成器使用转换后请求的最终设置。
     let request: ChatCompletionRequest = serde_json::from_value(body)?;
     let converted = request.convert(ConversionOptions::default())?;
-    let generator =
-        ChatCompletionRequest::chunk_generator(&converted, "id-1".into(), "deepseek-flash".into());
+    let generator = ChatCompletionRequest::chunk_generator(
+        &converted,
+        "id-1".into(),
+        "DeepSeek-V4.1-Flash".into(),
+    );
     let processor = StreamProcessor::new(generator, converted.parsing_options);
 
     // 模拟后端的推理 chunk。
@@ -50,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         InferenceChunk::Text {
             content: "Hello!".into(),
-            content_tokens: 2,
+            token_count: 2,
         },
         InferenceChunk::Finish {
             finish_reason: InferenceFinishReason::Stop,
@@ -58,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     // 将其转换为协议 chunk。
-    let mut chunks = std::pin::pin!(processor.process(inference));
+    let mut chunks = std::pin::pin!(processor.into_protocol_stream(inference));
     while let Some(chunk) = chunks.next().await {
         println!("{}", serde_json::to_string(&chunk?)?);
     }
@@ -82,19 +85,19 @@ from deepseek_recipe import (
 )
 
 request = ChatCompletionRequest({
-    "model": "deepseek-flash",
+    "model": "DeepSeek-V4.1-Flash",
     "messages": [{"role": "user", "content": "Hello"}],
     "thinking": {"type": "disabled"},
 })
 converted = request.convert(ConversionOptions())
-generator = ChatCompletionRequest.chunk_generator(converted, "id-1", "deepseek-flash")
+generator = ChatCompletionRequest.chunk_generator(converted, "id-1", "DeepSeek-V4.1-Flash")
 processor = StreamProcessor(generator, converted.parsing_options)
 
 # 模拟后端的推理 chunk。
 chunks = []
 for chunk in [
     InferenceChunk.ready(system_fingerprint="fp-1", prompt_usage=PromptUsage(prompt_tokens=4)),
-    InferenceChunk.text("Hello!", content_tokens=2),
+    InferenceChunk.text("Hello!", token_count=2),
     InferenceChunk.finish(InferenceFinishReason.Stop),
 ]:
     chunks.extend(processor.push(chunk))

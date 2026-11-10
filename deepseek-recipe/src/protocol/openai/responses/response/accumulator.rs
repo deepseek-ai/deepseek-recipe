@@ -1,12 +1,12 @@
-use crate::util::append_delta::AppendDelta;
+use crate::response::Accumulate;
 
 use super::schema::{
     ResponsesContentPart, ResponsesOutputItem, ResponsesResponse, ResponsesStreamEvent,
 };
 
 /// Apply events in generation order.
-impl AppendDelta<ResponsesStreamEvent> for ResponsesResponse {
-    fn append(&mut self, event: ResponsesStreamEvent) {
+impl Accumulate<ResponsesStreamEvent> for ResponsesResponse {
+    fn accumulate(&mut self, event: ResponsesStreamEvent) {
         match event {
             ResponsesStreamEvent::Created { response, .. }
             | ResponsesStreamEvent::InProgress { response, .. }
@@ -192,7 +192,8 @@ fn item_id(item: &ResponsesOutputItem) -> &str {
         ResponsesOutputItem::Message { id, .. }
         | ResponsesOutputItem::Reasoning { id, .. }
         | ResponsesOutputItem::FunctionCall { id, .. }
-        | ResponsesOutputItem::CustomToolCall { id, .. } => id,
+        | ResponsesOutputItem::CustomToolCall { id, .. }
+        | ResponsesOutputItem::ToolSearchCall { id, .. } => id,
     }
 }
 
@@ -204,9 +205,9 @@ fn valid_item_content(item: &ResponsesOutputItem) -> bool {
         ResponsesOutputItem::Reasoning { content, .. } => content
             .iter()
             .all(|part| matches!(part, ResponsesContentPart::ReasoningText { .. })),
-        ResponsesOutputItem::FunctionCall { .. } | ResponsesOutputItem::CustomToolCall { .. } => {
-            true
-        }
+        ResponsesOutputItem::FunctionCall { .. }
+        | ResponsesOutputItem::CustomToolCall { .. }
+        | ResponsesOutputItem::ToolSearchCall { .. } => true,
     }
 }
 

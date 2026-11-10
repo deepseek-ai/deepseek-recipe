@@ -11,21 +11,16 @@ use deepseek_recipe::anthropic::MessagesRequest;
 use deepseek_recipe::error_response::ErrorResponse;
 use deepseek_recipe::openai::{ChatCompletionRequest, ResponsesRequest};
 use deepseek_recipe::request::{
-    ConversationRequest, ConversionError, ConversionOptions, ProtocolRequest,
+    ConversationRequest, ConversionError, ConversionOptions, ModelVersion, ProtocolRequest,
 };
-use deepseek_recipe::response::ProtocolResponse;
-use deepseek_recipe::stream::state_machine::ReasoningStage;
+use deepseek_recipe::response::{Accumulate, ProtocolResponse};
 use deepseek_recipe::stream::{
-    ChunkGenerator, InferenceChunk, InferenceFinishReason, StreamProcessor,
+    ChunkGenerator, InferenceChunk, InferenceFinishReason, StreamProcessor, ThinkingInitialStage,
 };
-use deepseek_recipe::util::append_delta::AppendDelta;
-use deepseek_recipe_core::multimodal::IMAGE_SPECIAL_TOKEN;
+use deepseek_recipe_core::special_tokens::SpecialToken;
 use deepseek_recipe_encoding::PromptEncoding;
+use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
-use deepseek_recipe_encoding::v4::{
-    ASSISTANT_SP_TOKEN, BOS_TOKEN, DSML_SP_TOKEN, EOS_TOKEN, LATEST_REMINDER_SP_TOKEN,
-    SYSTEM_SP_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN, USER_SP_TOKEN,
-};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_stream::StreamExt;
 
@@ -67,47 +62,47 @@ impl Highlight {
 const HIGHLIGHTS: &[Highlight] = &[
     Highlight::new(
         "bos",
-        &[BOS_TOKEN],
-        "Begin of sentence. Marks the start of the prompt.",
+        &[SpecialToken::Bos.default_str()],
+        "Beginning-of-sentence token (BOS). Marks the start of the prompt.",
     ),
     Highlight::new(
         "system",
-        &[SYSTEM_SP_TOKEN],
+        &[SpecialToken::System.default_str()],
         "System turn marker. Starts a system message.",
     ),
     Highlight::new(
         "user",
-        &[USER_SP_TOKEN],
+        &[SpecialToken::User.default_str()],
         "User turn marker. Starts a user message.",
     ),
     Highlight::new(
         "assistant",
-        &[ASSISTANT_SP_TOKEN],
+        &[SpecialToken::Assistant.default_str()],
         "Assistant turn marker. Starts an assistant message.",
     ),
     Highlight::new(
         "thinking_start",
-        &[THINKING_START_TOKEN],
+        &[SpecialToken::ThinkingStart.default_str()],
         "Starts the reasoning content.",
     ),
     Highlight::new(
         "thinking_end",
-        &[THINKING_END_TOKEN],
+        &[SpecialToken::ThinkingEnd.default_str()],
         "Ends the reasoning content.",
     ),
     Highlight::new(
         "latest_reminder",
-        &[LATEST_REMINDER_SP_TOKEN],
+        &[SpecialToken::LatestReminder.default_str()],
         "Starts the latest reminder message.",
     ),
     Highlight::new(
         "eos",
-        &[EOS_TOKEN],
-        "End of sentence. Terminates the message.",
+        &[SpecialToken::Eos.default_str()],
+        "End-of-sentence token (EOS). Ends an assistant message.",
     ),
     Highlight::new(
         "dsml",
-        &[DSML_SP_TOKEN],
+        &[SpecialToken::Dsml.default_str()],
         "DeepSeek markup tag. Structures tool calls in the prompt.",
     ),
     Highlight::new(
@@ -117,7 +112,7 @@ const HIGHLIGHTS: &[Highlight] = &[
     ),
     Highlight::new(
         "image",
-        &[IMAGE_SPECIAL_TOKEN],
+        &[SpecialToken::Image.default_str()],
         "Marks one image in the prompt.",
     ),
     Highlight::new(
@@ -219,34 +214,34 @@ struct RenderResponse {
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum DecodeFinishReason {
+enum ParseFinishReason {
     #[default]
     Stop,
     Length,
     ContentFilter,
 }
 
-impl From<DecodeFinishReason> for InferenceFinishReason {
-    fn from(reason: DecodeFinishReason) -> Self {
+impl From<ParseFinishReason> for InferenceFinishReason {
+    fn from(reason: ParseFinishReason) -> Self {
         match reason {
-            DecodeFinishReason::Stop => Self::Stop,
-            DecodeFinishReason::Length => Self::Length,
-            DecodeFinishReason::ContentFilter => Self::ContentFilter,
+            ParseFinishReason::Stop => Self::Stop,
+            ParseFinishReason::Length => Self::Length,
+            ParseFinishReason::ContentFilter => Self::ContentFilter,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct DecodeRequest {
+struct ParseRequest {
     format: ApiFormat,
     body: serde_json::Value,
     output: String,
     #[serde(default)]
-    finish_reason: DecodeFinishReason,
+    finish_reason: ParseFinishReason,
 }
 
 #[derive(Debug, Serialize)]
-struct DecodeResponse {
+struct ParseResponse {
     response: serde_json::Value,
     segments: Vec<Segment>,
 }
@@ -260,33 +255,50 @@ fn bad_request(detail: String) -> DemoError {
 fn conversion_failed(error: ConversionError) -> DemoError {
     let status =
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(error.into_response()))
+    (status, Json(error.into_error_response()))
 }
 
-fn convert_request<T>(mut body: serde_json::Value) -> Result<ConversationRequest, DemoError>
+/// Convert a protocol request, returning it alongside the requested model name
+/// echoed into responses.
+fn convert_request<T>(
+    mut body: serde_json::Value,
+) -> Result<(ConversationRequest, String), DemoError>
 where
     T: ProtocolRequest + DeserializeOwned,
 {
-    // Requests use V4.1 prompt rendering and a default model name.
+    // A request without a model name uses the default name, which targets V4.1.
+    const DEFAULT_MODEL: &str = "encoding-decoding-demo";
     if let Some(body) = body.as_object_mut() {
-        body.entry("model")
-            .or_insert_with(|| "encoding-decoding-demo".into());
+        body.entry("model").or_insert_with(|| DEFAULT_MODEL.into());
     }
+    let model = body["model"].as_str().unwrap_or(DEFAULT_MODEL).to_owned();
     let request: T = serde_json::from_value(body)
         .map_err(|err| bad_request(format!("invalid request body: {err}")))?;
-    request
-        .convert(ConversionOptions::default())
-        .map_err(conversion_failed)
+    // The demo also accepts the DeepSeek API model names.
+    let converted = request
+        .convert(
+            ConversionOptions::default()
+                .with_model_alias(DEFAULT_MODEL, ModelVersion::DeepseekV41Flash)
+                .with_model_alias("deepseek-v4-pro", ModelVersion::DeepseekV4Pro)
+                .with_model_alias("deepseek-flash", ModelVersion::DeepseekV41Flash),
+        )
+        .map_err(conversion_failed)?;
+    Ok((converted, model))
 }
 
 fn render_prompt<T>(body: serde_json::Value) -> Result<String, DemoError>
 where
     T: ProtocolRequest + DeserializeOwned,
 {
-    let request = convert_request::<T>(body)?;
-    Ok(DeepseekV41Encoding::new()
-        .render_conversation(&request.conversation)
-        .prompt)
+    let (request, _) = convert_request::<T>(body)?;
+    // The model version of the request selects the prompt encoding.
+    let rendered = match request.model_version {
+        ModelVersion::DeepseekV4Pro => {
+            DeepseekV4Encoding::new().render_conversation(&request.conversation)
+        }
+        _ => DeepseekV41Encoding::new().render_conversation(&request.conversation),
+    };
+    Ok(rendered.prompt)
 }
 
 async fn render_handler(
@@ -301,36 +313,38 @@ async fn render_handler(
     Ok(Json(RenderResponse { prompt, segments }))
 }
 
-async fn decode_output<T>(request: DecodeRequest) -> Result<serde_json::Value, DemoError>
+async fn parse_output<T>(request: ParseRequest) -> Result<serde_json::Value, DemoError>
 where
     T: ProtocolRequest + DeserializeOwned,
     <<T::Response as ProtocolResponse>::ChunkGenerator as ChunkGenerator>::Chunk: Send,
 {
-    let mut converted = convert_request::<T>(request.body)?;
+    let (mut converted, model) = convert_request::<T>(request.body)?;
     // This endpoint always accumulates a complete response, including usage,
     // even when the input request originally selected streaming transport.
     converted.stream = false;
-    let (output, finish_reason) = match request.output.split_once(EOS_TOKEN) {
+    let (output, finish_reason) = match request.output.split_once(SpecialToken::Eos.default_str()) {
         Some((output, _)) => (output, InferenceFinishReason::Stop),
         None => (request.output.as_str(), request.finish_reason.into()),
     };
-    // The demo accepts complete assistant output. Consume its leading frame
-    // markers here; the stream parser normally starts after a prompt prefill.
-    let output = output.strip_prefix(ASSISTANT_SP_TOKEN).unwrap_or(output);
-    let (thinking, output) = match output.strip_prefix(THINKING_START_TOKEN) {
+    // The stream parser expects output that starts after the prompt's
+    // assistant-turn start (`<｜Assistant｜><think>` or `</think>`). The demo
+    // accepts complete assistant output, so it strips that start here.
+    let output = output
+        .strip_prefix(SpecialToken::Assistant.default_str())
+        .unwrap_or(output);
+    let (thinking, output) = match output.strip_prefix(SpecialToken::ThinkingStart.default_str()) {
         Some(output) => (true, output),
         None => (
             false,
-            output.strip_prefix(THINKING_END_TOKEN).unwrap_or(output),
+            output
+                .strip_prefix(SpecialToken::ThinkingEnd.default_str())
+                .unwrap_or(output),
         ),
     };
     converted.conversation.thinking_mode = thinking;
-    converted.parsing_options.reasoning_initial_stage = thinking.then_some(ReasoningStage::Start);
-    converted.parsing_options.tool_call_initial_stage = false;
-    let model = converted
-        .model
-        .clone()
-        .unwrap_or_else(|| "encoding-decoding-demo".into());
+    converted.parsing_options.thinking_initial_stage =
+        thinking.then_some(ThinkingInitialStage::ReasoningStart);
+    converted.parsing_options.starts_in_tool_calls = false;
     let id = "demo-id".to_owned();
     let generator = T::chunk_generator(&converted, id.clone(), model.clone());
     let processor = StreamProcessor::new(generator, converted.parsing_options);
@@ -338,7 +352,7 @@ where
         InferenceChunk::Text {
             content: output.to_owned(),
             // Raw text alone does not supply tokenizer or backend usage data.
-            content_tokens: 0,
+            token_count: 0,
         },
         InferenceChunk::Finish { finish_reason },
     ]);
@@ -347,10 +361,10 @@ where
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     let mut response = T::Response::new(id, model, created, 0, 0);
-    let mut chunks = pin!(processor.process(inference));
+    let mut chunks = pin!(processor.into_protocol_stream(inference));
     while let Some(chunk) = chunks.next().await {
         response
-            .append(chunk.map_err(|error| {
+            .accumulate(chunk.map_err(|error| {
                 conversion_failed(ConversionError::internal(error.to_string()))
             })?);
     }
@@ -358,16 +372,16 @@ where
         .map_err(|error| conversion_failed(ConversionError::internal(error.to_string())))
 }
 
-async fn decode_handler(
-    Json(request): Json<DecodeRequest>,
-) -> Result<Json<DecodeResponse>, DemoError> {
+async fn parse_handler(
+    Json(request): Json<ParseRequest>,
+) -> Result<Json<ParseResponse>, DemoError> {
     let segments = segment(&request.output);
     let response = match request.format {
-        ApiFormat::ChatCompletions => decode_output::<ChatCompletionRequest>(request).await?,
-        ApiFormat::Responses => decode_output::<ResponsesRequest>(request).await?,
-        ApiFormat::Messages => decode_output::<MessagesRequest>(request).await?,
+        ApiFormat::ChatCompletions => parse_output::<ChatCompletionRequest>(request).await?,
+        ApiFormat::Responses => parse_output::<ResponsesRequest>(request).await?,
+        ApiFormat::Messages => parse_output::<MessagesRequest>(request).await?,
     };
-    Ok(Json(DecodeResponse { response, segments }))
+    Ok(Json(ParseResponse { response, segments }))
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
@@ -409,7 +423,7 @@ async fn main() {
             get(|| async { binary_asset("image/png", FAVICON_PNG) }),
         )
         .route("/api/render", post(render_handler))
-        .route("/api/decode", post(decode_handler));
+        .route("/api/parse", post(parse_handler));
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     println!("deepseek-recipe demo page: http://{addr}");
