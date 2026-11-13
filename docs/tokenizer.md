@@ -18,6 +18,12 @@ contain the spelling of every special token that rendering writes; otherwise
 ID of the image token in the bundled V4.1 tokenizer; a caller that uses this
 constant needs a tokenizer that assigns the image token the same token ID.
 
+A checkpoint can also ship its own `tokenizer.json` whose special-token
+spellings differ from the bundled copy. Pass the checkpoint's spellings through
+`SpecialTokens` to both the conversion options and the prompt encoding; the
+Python example below shows the code, and the Rust `ConversionOptions` and prompt
+encodings expose the same `with_special_tokens` method.
+
 ## Rust
 
 Add the dependencies to your application:
@@ -186,6 +192,33 @@ Hugging Face Hub, and `Tokenizer.from_str` loads the file contents directly.
 raises `RuntimeError` when no tokenizer is attached or encoding fails. After
 encoding, `ConversationRequest.resolve_max_tokens` resolves `max_tokens` as in
 Rust and raises `ConversionError` where Rust returns one.
+
+### Token spellings a checkpoint changes
+
+A checkpoint's own `tokenizer.json` can spell a special token differently from
+the bundled copy. For example, some V4.1 Flash checkpoints spell the image token
+`<｜deepseek_image｜>`, where `static/tokenizers/v41/tokenizer.json` spells it
+`<｜image｜>`. Rendering writes the bundled spelling, so encoding a prompt with
+an image fails because that spelling is not in the checkpoint tokenizer's added
+vocabulary.
+
+Pass the checkpoint's spelling to the conversion options and to the prompt
+encoding:
+
+```python
+from deepseek_recipe import (
+    ConversionOptions,
+    DeepseekV41Encoding,
+    SpecialTokens,
+    Tokenizer,
+)
+
+special = SpecialTokens(image="<｜deepseek_image｜>")
+options = ConversionOptions(default_thinking_mode=False).with_special_tokens(special)
+encoding = DeepseekV41Encoding().with_special_tokens(special).with_tokenizer(
+    Tokenizer.from_file("path/to/checkpoint/tokenizer.json")
+)
+```
 
 ### Decoding
 
