@@ -6,6 +6,8 @@
 
 请使用与模型匹配的 tokenizer。本仓库在 [`static/tokenizers/`](../static/tokenizers/README.md) 下内置了 V4 与 V4.1 prompt encoding 对应的副本，从对应目录加载 `tokenizer.json` 即可。也可以从 Hugging Face Hub 加载 tokenizer：其 added vocabulary 必须包含渲染写入的每个 special token 的拼写，否则 `encode` 返回 `EncodingError::Encode`。`IMAGE_SPECIAL_TOKEN_ID` 是内置 V4.1 tokenizer 中图片 token 的 token ID；使用该常量的调用方需要图片 token ID 与之相同的 tokenizer。
 
+checkpoint 也可能自带 `tokenizer.json`，其中 special token 的拼写与内置副本不同。把 checkpoint 的拼写通过 `SpecialTokens` 同时传给转换选项和 prompt encoding；下方 Python 示例给出代码，Rust 的 `ConversionOptions` 与 prompt encoding 也有同名的 `with_special_tokens` 方法。
+
 ## Rust
 
 为你的应用添加依赖：
@@ -122,6 +124,27 @@ print(encoding.encode(converted.conversation))
 ```
 
 `Tokenizer.from_pretrained` 从 Hugging Face Hub 下载并缓存 `tokenizer.json`，`Tokenizer.from_str` 直接加载文件内容。`render_conversation` 与 `encode` 的结果与 Rust 一致；未附加 tokenizer 或编码失败时，`encode` 抛出 `RuntimeError`。编码之后，`ConversationRequest.resolve_max_tokens` 按与 Rust 相同的规则解析 `max_tokens`，在 Rust 返回错误的情况下抛出 `ConversionError`。
+
+### checkpoint 改写的 token 拼写
+
+checkpoint 自带的 `tokenizer.json` 可能与内置副本对同一个 special token 使用不同拼写。例如部分 V4.1 Flash checkpoint 把图片 token 写作 `<｜deepseek_image｜>`，而 `static/tokenizers/v41/tokenizer.json` 写作 `<｜image｜>`。渲染写入的是内置拼写，因此带图片的 prompt 会因该拼写不在 checkpoint tokenizer 的 added vocabulary 中而编码失败。
+
+把 checkpoint 的拼写同时传给转换选项与 prompt encoding：
+
+```python
+from deepseek_recipe import (
+    ConversionOptions,
+    DeepseekV41Encoding,
+    SpecialTokens,
+    Tokenizer,
+)
+
+special = SpecialTokens(image="<｜deepseek_image｜>")
+options = ConversionOptions(default_thinking_mode=False).with_special_tokens(special)
+encoding = DeepseekV41Encoding().with_special_tokens(special).with_tokenizer(
+    Tokenizer.from_file("path/to/checkpoint/tokenizer.json")
+)
+```
 
 ### 解码
 
