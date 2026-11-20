@@ -43,7 +43,7 @@ mod response;
 mod special_tokens;
 mod tokenizer;
 
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
