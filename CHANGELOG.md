@@ -8,6 +8,12 @@ minor version can contain incompatible changes.
 
 ## Unreleased
 
+### Changed
+
+- **Free-threaded Python.** The `_native` extension declares that it does not
+  need the GIL (`#[pymodule(gil_used = false)]`), so importing it on a
+  free-threaded CPython build (for example 3.14t) keeps the GIL disabled.
+
 ## 0.2.0 - 2026-10-20
 
 This release changes the public API of every crate and of the Python package.
